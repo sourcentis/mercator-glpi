@@ -2,10 +2,12 @@
 
 namespace App\Services\Glpi\Mappers;
 
+use App\Services\Glpi\Mappers\Concerns\MapsInfocomInstallDate;
 use App\Services\Glpi\Mappers\Concerns\ResolvesGlpiBay;
 
 class PhysicalServerMapper
 {
+    use MapsInfocomInstallDate;
     use ResolvesGlpiBay;
 
     public function __construct(private readonly WorkstationMapper $base) {}
@@ -17,7 +19,7 @@ class PhysicalServerMapper
      */
     public function map(array $item, array $context): array
     {
-        $payload = $this->base->map($item, $context);
+        $payload = $this->withInstallDate($this->base->map($item, $context), $item);
 
         $bayId = $this->resolveBayId('Computer', $item['id'], $context);
         if ($bayId !== null) {

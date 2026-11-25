@@ -95,3 +95,32 @@ it('PhysicalServerMapper mappe le CPU et l\'OS via WorkstationMapper', function 
     expect($payload['cpu'])->toBe('Intel Core i7-1165G7 — 2800 MHz — 4 cœurs');
     expect($payload['operating_system'])->toBe('Windows 11 Pro — 23H2');
 });
+
+// ── Issue #19 : date de mise en service Infocom → install_date ──────────────
+
+it('PhysicalServerMapper mappe la date de mise en service Infocom sur install_date', function () {
+    $payload = (new PhysicalServerMapper(new WorkstationMapper))->map(
+        ['id' => 42, 'name' => 'SRV-01', '_infocoms' => ['use_date' => '2021-09-30 00:00:00']],
+        ['buildings_map' => [], 'sites_map' => [], 'item_rack_map' => [], 'racks_map' => []]
+    );
+
+    expect($payload['install_date'])->toBe('2021-09-30');
+});
+
+it('PhysicalServerMapper n\'envoie pas install_date sans date de mise en service', function () {
+    $payload = (new PhysicalServerMapper(new WorkstationMapper))->map(
+        ['id' => 42, 'name' => 'SRV-01', '_infocoms' => ['buy_date' => '2021-09-01']],
+        ['buildings_map' => [], 'sites_map' => [], 'item_rack_map' => [], 'racks_map' => []]
+    );
+
+    expect(array_key_exists('install_date', $payload))->toBeFalse();
+});
+
+it('WorkstationMapper n\'envoie jamais install_date (champ absent des postes Mercator)', function () {
+    $payload = (new WorkstationMapper)->map(
+        ['id' => 42, 'name' => 'PC-01', '_infocoms' => ['use_date' => '2023-04-12']],
+        ['buildings_map' => [], 'sites_map' => []]
+    );
+
+    expect(array_key_exists('install_date', $payload))->toBeFalse();
+});
