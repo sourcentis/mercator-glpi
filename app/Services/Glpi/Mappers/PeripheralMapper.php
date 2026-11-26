@@ -3,11 +3,13 @@
 namespace App\Services\Glpi\Mappers;
 
 use App\Services\Glpi\Mappers\Concerns\AppendsUnmappedFields;
+use App\Services\Glpi\Mappers\Concerns\MapsInfocomLifecycle;
 use App\Services\Glpi\Mappers\Concerns\ResolvesGlpiLocationName;
 
 class PeripheralMapper
 {
     use AppendsUnmappedFields;
+    use MapsInfocomLifecycle;
     use ResolvesGlpiLocationName;
     /**
      * Mappe un Peripheral GLPI (expand_dropdowns=1) vers un payload Mercator.
@@ -24,14 +26,18 @@ class PeripheralMapper
         $payload = array_filter([
             'name'        => $item['name'],
             'description' => $this->buildDescription($item, [
-                'peripheraltypes_id', 'manufacturers_id', 'peripheralmodels_id', 'users_id_tech', 'locations_id',
+                'serial', 'peripheraltypes_id', 'manufacturers_id', 'peripheralmodels_id', 'users_id_tech', 'locations_id',
             ]),
             'type'        => $this->nullable($item['peripheraltypes_id'] ?? null),
             'vendor'      => $this->nullable($item['manufacturers_id'] ?? null),
             'product'     => $this->nullable($item['peripheralmodels_id'] ?? null),
+            'serial_number' => $this->nullable($item['serial'] ?? null),
             'responsible' => $this->nullable($item['users_id_tech'] ?? null),
             'address_ip'  => $this->extractIp($item),
         ], fn($v) => $v !== null);
+
+        // install_date, warranty_end_date, end_of_life_date (Infocom) — issue #19.
+        $payload += $this->infocomLifecycle($item);
 
         // building_id/site_id toujours inclus (même null), cf. WorkstationMapper::map().
         $payload['building_id'] = $building['id'] ?? null;

@@ -60,30 +60,38 @@ it('inclut building_id et site_id à null si salle inconnue', function () {
     expect($result['site_id'])->toBeNull();
 });
 
-it('mappe le fabricant en vendor', function () {
+// PhysicalSwitch Mercator n'a pas de vendor/product (champs ignorés par l'API) :
+// fabricant / modèle / n° de série vont dans manufacturer / model / serial_number.
+it('mappe le fabricant en manufacturer', function () {
     $result = (new NetworkDeviceMapper)->map(glpiNetworkDevice(), ['buildings_map' => []]);
 
-    expect($result['vendor'])->toBe('Cisco');
+    expect($result['manufacturer'])->toBe('Cisco');
 });
 
-it('mappe le modèle en product', function () {
+it('mappe le modèle en model', function () {
     $result = (new NetworkDeviceMapper)->map(glpiNetworkDevice(), ['buildings_map' => []]);
 
-    expect($result['product'])->toBe('Catalyst 2960');
+    expect($result['model'])->toBe('Catalyst 2960');
 });
 
-it('n\'inclut pas vendor si fabricant absent', function () {
+it('mappe le numéro de série en serial_number', function () {
+    $result = (new NetworkDeviceMapper)->map(glpiNetworkDevice(['serial' => 'FOC1234X0AB']), ['buildings_map' => []]);
+
+    expect($result['serial_number'])->toBe('FOC1234X0AB')
+        ->and($result['description'] ?? '')->not->toContain('FOC1234X0AB');
+});
+
+it('n\'inclut pas manufacturer si fabricant absent', function () {
     $result = (new NetworkDeviceMapper)->map(glpiNetworkDevice(['manufacturers_id' => 0]), ['buildings_map' => []]);
 
-    expect($result)->not->toHaveKey('vendor');
+    expect($result)->not->toHaveKey('manufacturer');
 });
 
 it('ne mappe pas les champs non présents dans PhysicalSwitch Mercator', function () {
     $result = (new NetworkDeviceMapper)->map(glpiNetworkDevice(), ['buildings_map' => []]);
 
-    expect($result)->not->toHaveKey('manufacturer');
-    expect($result)->not->toHaveKey('model');
-    expect($result)->not->toHaveKey('serial_number');
+    expect($result)->not->toHaveKey('vendor');
+    expect($result)->not->toHaveKey('product');
     expect($result)->not->toHaveKey('address_ip');
     expect($result)->not->toHaveKey('mac_address');
 });

@@ -2,12 +2,8 @@
 
 namespace App\Services\Glpi\Mappers;
 
-use App\Services\Glpi\Mappers\Concerns\MapsInfocomInstallDate;
-
 class LogicalServerMapper
 {
-    use MapsInfocomInstallDate;
-
     public function __construct(private readonly WorkstationMapper $base) {}
 
     /**
@@ -16,6 +12,6 @@ class LogicalServerMapper
      */
     public function map(array $item, array $context): array
     {
-        return $this->withInstallDate($this->base->map($item, $context), $item);
+        return $this->base->map($item, $context);
     }
 }

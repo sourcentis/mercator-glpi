@@ -126,10 +126,13 @@ it('produit les mêmes payloads workstation qu\'en API v1 (hors address_ip)', fu
             'cpu' => 'Intel Core i7-11700 — 2500 MHz — 8 cœurs',
             'disk' => 512000,
             'purchase_date' => '2024-01-15',
-            'warranty_start_date' => '2024-01-02',
+            // Début de garantie = date_warranty (et non date_order) ; fin calculée
+            // comme GLPI : date_warranty + warranty_duration mois (issue #19).
+            'warranty_start_date' => '2024-01-15',
             'warranty_period' => '36 mois',
             'fin_value' => 1200.0,
             'update_source' => 'GLPI',
+            'warranty_end_date' => '2027-01-15',
             'building_id' => 7,
             'site_id' => 1,
             'ext_refs' => '{GLPI}2',

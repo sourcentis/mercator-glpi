@@ -3,11 +3,13 @@
 namespace App\Services\Glpi\Mappers;
 
 use App\Services\Glpi\Mappers\Concerns\AppendsUnmappedFields;
+use App\Services\Glpi\Mappers\Concerns\MapsInfocomLifecycle;
 use App\Services\Glpi\Mappers\Concerns\ResolvesGlpiLocationName;
 
 class WorkstationMapper
 {
     use AppendsUnmappedFields;
+    use MapsInfocomLifecycle;
     use ResolvesGlpiLocationName;
 
     /**
@@ -42,15 +44,19 @@ class WorkstationMapper
             'memory' => $this->formatRam($item['ram'] ?? null),
             'disk' => $this->extractDiskTotal($item),
             'last_inventory_date' => $this->parseDate($item['date_last_boot'] ?? null),
-            'purchase_date' => $this->parseDate($item['_infocoms']['buy_date'] ?? null),
-            'warranty_start_date' => $this->parseDate($item['_infocoms']['order_date'] ?? null),
-            'warranty_end_date' => $this->parseDate($item['_infocoms']['warranty_expiration'] ?? null),
+            'purchase_date' => $this->infocomDate($item['_infocoms']['buy_date'] ?? null),
+            // Début de garantie = warranty_date (et non order_date, date de commande).
+            'warranty_start_date' => $this->infocomDate($item['_infocoms']['warranty_date'] ?? null),
+            'warranty' => $this->nullable($item['_infocoms']['warranty_info'] ?? null),
             'warranty_period' => $this->formatWarrantyPeriod($item['_infocoms']['warranty_duration'] ?? null),
             'fin_value' => isset($item['_infocoms']['value'])
                 ? (float) $item['_infocoms']['value']
                 : null,
             'update_source' => 'GLPI',
         ], fn ($v) => $v !== null);
+
+        // install_date, warranty_end_date (calculée), end_of_life_date — issue #19.
+        $payload += $this->infocomLifecycle($item);
 
         // building_id/site_id sont toujours inclus, même null : sinon array_filter les
         // retire du payload et une mise à jour (déplacement, ou salle non résolue) ne
@@ -248,8 +254,12 @@ class WorkstationMapper
 
     private function formatWarrantyPeriod(mixed $months): ?string
     {
-        if ($months === null || $months === '' || $months === 0) {
+        if ($months === null || $months === '' || (int) $months === 0) {
             return null;
+        }
+
+        if ((int) $months === -1) {
+            return 'À vie';
         }
 
         return (int) $months.' mois';

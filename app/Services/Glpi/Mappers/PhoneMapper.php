@@ -3,11 +3,13 @@
 namespace App\Services\Glpi\Mappers;
 
 use App\Services\Glpi\Mappers\Concerns\AppendsUnmappedFields;
+use App\Services\Glpi\Mappers\Concerns\MapsInfocomLifecycle;
 use App\Services\Glpi\Mappers\Concerns\ResolvesGlpiLocationName;
 
 class PhoneMapper
 {
     use AppendsUnmappedFields;
+    use MapsInfocomLifecycle;
     use ResolvesGlpiLocationName;
     /**
      * Mappe un Phone GLPI (expand_dropdowns=1) vers un payload Mercator.
@@ -24,13 +26,17 @@ class PhoneMapper
         $payload = array_filter([
             'name'        => $item['name'],
             'description' => $this->buildDescription($item, [
-                'phonetypes_id', 'manufacturers_id', 'phonemodels_id', 'locations_id',
+                'serial', 'phonetypes_id', 'manufacturers_id', 'phonemodels_id', 'locations_id',
             ]),
             'type'        => $this->nullable($item['phonetypes_id'] ?? null),
-            'vendor'      => $this->nullable($item['manufacturers_id'] ?? null),
-            'product'     => $this->nullable($item['phonemodels_id'] ?? null),
+            'manufacturer' => $this->nullable($item['manufacturers_id'] ?? null),
+            'model'       => $this->nullable($item['phonemodels_id'] ?? null),
+            'serial_number' => $this->nullable($item['serial'] ?? null),
             'address_ip'  => $this->extractIp($item),
         ], fn($v) => $v !== null);
+
+        // install_date, warranty_end_date, end_of_life_date (Infocom) — issue #19.
+        $payload += $this->infocomLifecycle($item);
 
         // building_id/site_id toujours inclus (même null), cf. WorkstationMapper::map().
         $payload['building_id'] = $building['id'] ?? null;

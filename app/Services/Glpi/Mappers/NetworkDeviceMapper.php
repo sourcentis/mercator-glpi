@@ -3,12 +3,14 @@
 namespace App\Services\Glpi\Mappers;
 
 use App\Services\Glpi\Mappers\Concerns\AppendsUnmappedFields;
+use App\Services\Glpi\Mappers\Concerns\MapsInfocomLifecycle;
 use App\Services\Glpi\Mappers\Concerns\ResolvesGlpiBay;
 use App\Services\Glpi\Mappers\Concerns\ResolvesGlpiLocationName;
 
 class NetworkDeviceMapper
 {
     use AppendsUnmappedFields;
+    use MapsInfocomLifecycle;
     use ResolvesGlpiBay;
     use ResolvesGlpiLocationName;
     /**
@@ -28,13 +30,17 @@ class NetworkDeviceMapper
         $payload = array_filter([
             'name'        => $item['name'],
             'description' => $this->buildDescription($item, [
-                'networkequipmenttypes_id', 'manufacturers_id', 'networkequipmentmodels_id', 'locations_id',
+                'serial', 'networkequipmenttypes_id', 'manufacturers_id', 'networkequipmentmodels_id', 'locations_id',
             ]),
             'type'        => $this->mapType($item['networkequipmenttypes_id'] ?? null),
-            'vendor'      => $this->nullable($item['manufacturers_id'] ?? null),
-            'product'     => $this->nullable($item['networkequipmentmodels_id'] ?? null),
+            'manufacturer' => $this->nullable($item['manufacturers_id'] ?? null),
+            'model'       => $this->nullable($item['networkequipmentmodels_id'] ?? null),
+            'serial_number' => $this->nullable($item['serial'] ?? null),
             'bay_id'      => $this->resolveBayId('NetworkEquipment', $item['id'], $context),
         ], fn($v) => $v !== null);
+
+        // install_date, warranty_end_date, end_of_life_date (Infocom) — issue #19.
+        $payload += $this->infocomLifecycle($item);
 
         // building_id/site_id toujours inclus (même null), cf. WorkstationMapper::map().
         $payload['building_id'] = $building['id'] ?? null;

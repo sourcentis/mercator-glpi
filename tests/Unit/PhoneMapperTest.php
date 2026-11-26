@@ -38,10 +38,11 @@ it('mappe le nom du téléphone', function () {
     expect($result['name'])->toBe('TEL-DG-01');
 });
 
-it('mappe le fabricant en vendor', function () {
+// Phone Mercator n'a pas de vendor/product : manufacturer / model / serial_number.
+it('mappe le fabricant en manufacturer', function () {
     $result = (new PhoneMapper)->map(glpiPhone(), ['buildings_map' => []]);
 
-    expect($result['vendor'])->toBe('Cisco');
+    expect($result['manufacturer'])->toBe('Cisco');
 });
 
 it('mappe le type', function () {
@@ -50,10 +51,10 @@ it('mappe le type', function () {
     expect($result['type'])->toBe('IP');
 });
 
-it('mappe le modèle en product', function () {
+it('mappe le modèle en model', function () {
     $result = (new PhoneMapper)->map(glpiPhone(), ['buildings_map' => []]);
 
-    expect($result['product'])->toBe('IP Phone 8841');
+    expect($result['model'])->toBe('IP Phone 8841');
 });
 
 // ── Description ──────────────────────────────────────────────────────────────
@@ -143,7 +144,7 @@ it('ignore les champs dropdowns à 0', function () {
         'phonemodels_id' => 0,
     ]), ['buildings_map' => []]);
 
-    expect($result)->not->toHaveKey('vendor');
+    expect($result)->not->toHaveKey('manufacturer');
     expect($result)->not->toHaveKey('type');
-    expect($result)->not->toHaveKey('product');
+    expect($result)->not->toHaveKey('model');
 });

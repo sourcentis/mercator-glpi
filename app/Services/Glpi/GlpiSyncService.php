@@ -267,7 +267,8 @@ class GlpiSyncService
         // de charger toutes les DatabaseInstance/Database GLPI en plus de la collection
         // Database déjà chargée à l'étape 1.
         if ($handler instanceof SupportsDatabaseInstanceResolution) {
-            $context['database_types'] = $this->buildDatabaseTypesMap($glpi);
+            ['types' => $context['database_types'], 'install_dates' => $context['database_install_dates']]
+                = $this->buildDatabaseInstanceMaps($glpi);
         }
 
         // ── 6. GLPI → Mercator : créer ou mettre à jour ───────────────────────
@@ -1393,9 +1394,16 @@ class GlpiSyncService
      * Une Database GLPI ne porte ni son type ni son hôte directement : les deux vivent
      * sur la DatabaseInstance pointée par databaseinstances_id.
      *
-     * @return array<int, string> id GLPI de la Database → nom du type de technologie
+     * Indexe aussi la date de mise en service (Infocom use_date, issue #19) : dans GLPI,
+     * l'Infocom est porté par la DatabaseInstance (l'actif), pas par la Database. Il
+     * n'est fiable qu'item par item (with_infocoms, cf. SupportsGlpiItemDetail) : un
+     * getItem() par instance réellement référencée, dédupliqué. Une instance en erreur
+     * (supprimée, droits…) est ignorée sans faire échouer le run.
+     *
+     * @return array{types: array<int, string>, install_dates: array<int, string>}
+     *               id GLPI de la Database → nom du type / date « Y-m-d »
      */
-    private function buildDatabaseTypesMap(GlpiClientInterface $glpi): array
+    private function buildDatabaseInstanceMaps(GlpiClientInterface $glpi): array
     {
         // expand_dropdowns=1 : databaseinstancetypes_id doit être le NOM du type
         // (MariaDB, PostgreSQL…), l'id lui-même de la DatabaseInstance reste numérique.
@@ -1422,7 +1430,36 @@ class GlpiSyncService
 
         Log::info('[databases] '.count($typeByDbId).' type(s) de technologie résolus via DatabaseInstance');
 
-        return $typeByDbId;
+        $installDateByInstanceId = [];
+        $installDateByDbId = [];
+        foreach ($databases as $database) {
+            $instanceId = (int) ($database['databaseinstances_id'] ?? 0);
+
+            if ($instanceId === 0) {
+                continue;
+            }
+
+            if (! array_key_exists($instanceId, $installDateByInstanceId)) {
+                try {
+                    $instance = $glpi->getItem('DatabaseInstance', $instanceId, ['expand_dropdowns' => 0, 'with_infocoms' => 1]);
+                    $useDate = $instance['_infocoms']['use_date'] ?? null;
+                    $installDateByInstanceId[$instanceId] = is_string($useDate) && $useDate !== '' && ! str_starts_with($useDate, '0000-00-00')
+                        ? substr($useDate, 0, 10)
+                        : null;
+                } catch (Throwable $e) {
+                    $installDateByInstanceId[$instanceId] = null;
+                    Log::warning("[databases] DatabaseInstance #{$instanceId} : Infocom non récupéré — ".$e->getMessage());
+                }
+            }
+
+            if ($installDateByInstanceId[$instanceId] !== null) {
+                $installDateByDbId[(int) $database['id']] = $installDateByInstanceId[$instanceId];
+            }
+        }
+
+        Log::info('[databases] '.count($installDateByDbId).' date(s) de mise en service résolues via DatabaseInstance');
+
+        return ['types' => $typeByDbId, 'install_dates' => $installDateByDbId];
     }
 
     /**

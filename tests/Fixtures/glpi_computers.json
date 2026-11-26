@@ -52,7 +52,10 @@
     "_infocoms": {
       "buy_date": "2022-03-15",
       "order_date": "2022-03-01",
-      "warranty_expiration": "2025-03-15",
+      "use_date": "2022-04-04",
+      "warranty_date": "2022-03-15",
+      "warranty_info": "ProSupport",
+      "decommission_date": "0000-00-00",
       "warranty_duration": 36,
       "value": 1299.0
     }

@@ -619,12 +619,17 @@ En mode `applications`, le payload mappé est :
 | Premier CPU (`_devices`) | `cpu` |
 | Somme des disques | `disk` |
 | `date_last_boot` | `last_inventory_date` |
-| `_infocoms.order_date` | `warranty_start_date` |
 | `_infocoms.buy_date` | `purchase_date` |
-| `_infocoms.warranty_expiration` | `warranty_end_date` |
-| `_infocoms.warranty_duration` | `warranty_period` (formaté en mois) |
+| `_infocoms.use_date` | `install_date` (date de mise en service) |
+| `_infocoms.warranty_date` | `warranty_start_date` |
+| `_infocoms.warranty_date` + `warranty_duration` | `warranty_end_date` (calculée comme GLPI : début + durée en mois ; rien pour une garantie à vie) |
+| `_infocoms.warranty_duration` | `warranty_period` (formaté en mois, `-1` → « À vie ») |
+| `_infocoms.warranty_info` | `warranty` |
+| `_infocoms.decommission_date` | `end_of_life_date` (date de réforme) |
 | `_infocoms.value` | `fin_value` |
 | `"GLPI"` | `update_source` |
+
+> **Infocom (issue #19)** : les dates de cycle de vie (mise en service, fin de garantie, réforme) sont lues dans l'onglet « Informations financières et administratives » de chaque actif. `with_infocoms` n'étant pas fiable sur les requêtes de collection, l'Infocom est récupéré item par item (un appel API supplémentaire par équipement). Infocom ne stocke pas de date de fin de garantie : elle est calculée comme dans GLPI (`warranty_date` + `warranty_duration` mois). Une date absente côté GLPI n'est jamais envoyée, pour ne pas écraser une saisie manuelle dans Mercator. Ces champs nécessitent Mercator ≥ la version qui ajoute le bloc « Cycle de vie » aux équipements.
 
 #### Équipements réseau — switches (`NetworkEquipment` → `physical-switches`)
 
@@ -633,11 +638,15 @@ En mode `applications`, le payload mappé est :
 | `name` | `name` |
 | `comment` | `description` |
 | `networkequipmenttypes_id` | `type` |
-| `manufacturers_id` | `vendor` |
-| `networkequipmentmodels_id` | `product` |
+| `manufacturers_id` | `manufacturer` |
+| `networkequipmentmodels_id` | `model` |
+| `serial` | `serial_number` |
 | `locations_id` | `building_id` + `site_id` (résolution par nom) |
 | Rack GLPI (relation `Item_Rack`) | `bay_id` (résolu via la bay Mercator déjà synchronisée) |
-| Champs non mappés (serial, statut…) | sérialisés dans `description` |
+| `_infocoms.use_date` | `install_date` (date de mise en service) |
+| `_infocoms.warranty_date` + `warranty_duration` | `warranty_end_date` (calculée comme GLPI) |
+| `_infocoms.decommission_date` | `end_of_life_date` (date de réforme) |
+| Champs non mappés (statut…) | sérialisés dans `description` |
 
 #### Équipements réseau — routeurs (`NetworkEquipment` → `physical-routers`)
 
@@ -648,8 +657,14 @@ Filtré par `GLPI_NETWORK_DEVICE_TYPES_ROUTERS` (opt-in, vide = aucun équipemen
 | `name` | `name` |
 | `comment` | `description` |
 | `networkequipmenttypes_id` | `type` |
+| `manufacturers_id` | `manufacturer` |
+| `networkequipmentmodels_id` | `model` |
+| `serial` | `serial_number` |
 | `locations_id` | `building_id` + `site_id` (résolution par nom) |
 | Rack GLPI (relation `Item_Rack`) | `bay_id` (résolu via la bay Mercator déjà synchronisée) |
+| `_infocoms.use_date` | `install_date` (date de mise en service) |
+| `_infocoms.warranty_date` + `warranty_duration` | `warranty_end_date` (calculée comme GLPI) |
+| `_infocoms.decommission_date` | `end_of_life_date` (date de réforme) |
 
 #### Équipements réseau — bornes Wifi (`NetworkEquipment` → `wifi-terminals`)
 
@@ -662,8 +677,12 @@ Filtré par `GLPI_NETWORK_DEVICE_TYPES_WIFI_TERMINALS` (opt-in, vide = aucun éq
 | `networkequipmenttypes_id` | `type` |
 | `manufacturers_id` | `vendor` |
 | `networkequipmentmodels_id` | `product` |
+| `serial` | `serial_number` |
 | `locations_id` | `building_id` + `site_id` (résolution par nom) |
 | Premier port IPv4 | `address_ip` |
+| `_infocoms.use_date` | `install_date` (date de mise en service) |
+| `_infocoms.warranty_date` + `warranty_duration` | `warranty_end_date` (calculée comme GLPI) |
+| `_infocoms.decommission_date` | `end_of_life_date` (date de réforme) |
 
 #### Équipements réseau — dispositifs de sécurité physique (`NetworkEquipment` → `physical-security-devices`)
 
@@ -674,9 +693,15 @@ Filtré par `GLPI_NETWORK_DEVICE_TYPES_PHYSICAL_SECURITY_DEVICES` (opt-in, vide 
 | `name` | `name` |
 | `comment` | `description` |
 | `networkequipmenttypes_id` | `type` |
+| `manufacturers_id` | `manufacturer` |
+| `networkequipmentmodels_id` | `model` |
+| `serial` | `serial_number` |
 | `locations_id` | `building_id` + `site_id` (résolution par nom) |
 | Rack GLPI (relation `Item_Rack`) | `bay_id` (résolu via la bay Mercator déjà synchronisée) |
 | Premier port IPv4 | `address_ip` |
+| `_infocoms.use_date` | `install_date` (date de mise en service) |
+| `_infocoms.warranty_date` + `warranty_duration` | `warranty_end_date` (calculée comme GLPI) |
+| `_infocoms.decommission_date` | `end_of_life_date` (date de réforme) |
 
 #### Équipements réseau — dispositifs de stockage (`NetworkEquipment` → `storage-devices`)
 
@@ -687,9 +712,15 @@ Filtré par `GLPI_NETWORK_DEVICE_TYPES_STORAGE_DEVICES` (opt-in, vide = aucun é
 | `name` | `name` |
 | `comment` | `description` |
 | `networkequipmenttypes_id` | `type` |
+| `manufacturers_id` | `manufacturer` |
+| `networkequipmentmodels_id` | `model` |
+| `serial` | `serial_number` |
 | `locations_id` | `building_id` + `site_id` (résolution par nom) |
 | Rack GLPI (relation `Item_Rack`) | `bay_id` (résolu via la bay Mercator déjà synchronisée) |
 | Premier port IPv4 | `address_ip` |
+| `_infocoms.use_date` | `install_date` (date de mise en service) |
+| `_infocoms.warranty_date` + `warranty_duration` | `warranty_end_date` (calculée comme GLPI) |
+| `_infocoms.decommission_date` | `end_of_life_date` (date de réforme) |
 
 #### Baies (`Rack` → `bays`)
 
@@ -726,6 +757,7 @@ Filtré par `GLPI_NETWORK_DEVICE_TYPES_STORAGE_DEVICES` (opt-in, vide = aucun é
 |---|---|
 | `name` | `name` |
 | `DatabaseInstance.databaseinstancetypes_id` (via `databaseinstances_id`) | `type` |
+| Infocom de la `DatabaseInstance` : `use_date` (un appel `with_infocoms` par instance) | `install_date` |
 | `"GLPI"` | `update_source` |
 
 Une `Database` GLPI ne porte pas directement son type de technologie (MariaDB, PostgreSQL, Oracle…) : celui-ci vit sur la `DatabaseInstance` parente, pointée par `databaseinstances_id`. Le connecteur résout ce type pour toutes les bases en un aller-retour supplémentaire (`DatabaseInstance` avec `expand_dropdowns=1`, puis jointure avec `Database` en `expand_dropdowns=0` pour garder `databaseinstances_id` numérique, cf. issue #8) et l'injecte dans le mapper via `SupportsDatabaseInstanceResolution`.

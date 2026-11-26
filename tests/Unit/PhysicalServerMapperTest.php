@@ -116,11 +116,11 @@ it('PhysicalServerMapper n\'envoie pas install_date sans date de mise en service
     expect(array_key_exists('install_date', $payload))->toBeFalse();
 });
 
-it('WorkstationMapper n\'envoie jamais install_date (champ absent des postes Mercator)', function () {
+it('WorkstationMapper mappe la date de mise en service Infocom sur install_date', function () {
     $payload = (new WorkstationMapper)->map(
         ['id' => 42, 'name' => 'PC-01', '_infocoms' => ['use_date' => '2023-04-12']],
         ['buildings_map' => [], 'sites_map' => []]
     );
 
-    expect(array_key_exists('install_date', $payload))->toBeFalse();
+    expect($payload['install_date'])->toBe('2023-04-12');
 });

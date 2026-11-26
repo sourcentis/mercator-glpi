@@ -9,7 +9,7 @@ use App\Services\Mercator\Contracts\MercatorClientInterface;
 use Mockery\MockInterface;
 
 // ── Résolution du type de technologie (Database GLPI → DatabaseInstance → type) ──
-// cf. SupportsDatabaseInstanceResolution, GlpiSyncService::buildDatabaseTypesMap().
+// cf. SupportsDatabaseInstanceResolution, GlpiSyncService::buildDatabaseInstanceMaps().
 
 function databaseTypesGlpiMock(array $databases, array $instances): MockInterface
 {
@@ -20,12 +20,12 @@ function databaseTypesGlpiMock(array $databases, array $instances): MockInterfac
         ->with('Database', Mockery::on(fn ($p) => ($p['expand_dropdowns'] ?? null) === 1))
         ->andReturn($databases);
 
-    // buildDatabaseTypesMap() : DatabaseInstance en expand_dropdowns=1 (type en nom).
+    // buildDatabaseInstanceMaps() : DatabaseInstance en expand_dropdowns=1 (type en nom).
     $mock->shouldReceive('getItems')
         ->with('DatabaseInstance', Mockery::on(fn ($p) => ($p['expand_dropdowns'] ?? null) === 1))
         ->andReturn($instances);
 
-    // buildDatabaseTypesMap() : Database en expand_dropdowns=0 (databaseinstances_id numérique, cf. issue #8).
+    // buildDatabaseInstanceMaps() : Database en expand_dropdowns=0 (databaseinstances_id numérique, cf. issue #8).
     $mock->shouldReceive('getItems')
         ->with('Database', Mockery::on(fn ($p) => ($p['expand_dropdowns'] ?? null) === 0))
         ->andReturn($databases);
@@ -151,3 +151,65 @@ it('n\'injecte database_types que pour un handler SupportsDatabaseInstanceResolu
 
     expect($handler::$capturedContext)->not->toHaveKey('database_types');
 });
+
+// ── Issue #19 : date de mise en service via l'Infocom de la DatabaseInstance ──
+
+it('mappe install_date depuis l\'Infocom de la DatabaseInstance parente', function () {
+    $glpi = databaseTypesGlpiMock(
+        databases: [
+            ['id' => 1, 'name' => 'prod-db', 'databaseinstances_id' => 10],
+            ['id' => 2, 'name' => 'prod-db2', 'databaseinstances_id' => 10],
+        ],
+        instances: [
+            ['id' => 10, 'databaseinstancetypes_id' => 'MariaDB'],
+        ],
+    );
+
+    // Un seul appel pour les deux bases de la même instance (dédupliqué).
+    $glpi->shouldReceive('getItem')
+        ->once()
+        ->with('DatabaseInstance', 10, Mockery::on(fn ($p) => ($p['with_infocoms'] ?? null) === 1))
+        ->andReturn(['id' => 10, '_infocoms' => ['use_date' => '2020-01-15 00:00:00']]);
+
+    $mercator = databaseTypesMercatorMock();
+
+    $created = [];
+    $mercator->shouldReceive('create')->andReturnUsing(function (string $ep, array $payload) use (&$created) {
+        $created[$payload['name']] = $payload;
+
+        return ['id' => 90 + count($created)] + $payload;
+    });
+
+    (new GlpiSyncService)->sync($glpi, $mercator, new DatabaseSyncHandler(new DatabaseMapper));
+
+    expect($created['prod-db']['install_date'])->toBe('2020-01-15')
+        ->and($created['prod-db2']['install_date'])->toBe('2020-01-15');
+});
+
+it('n\'envoie pas install_date si l\'Infocom de l\'instance est absent ou en erreur', function (bool $throws) {
+    $glpi = databaseTypesGlpiMock(
+        databases: [['id' => 1, 'name' => 'prod-db', 'databaseinstances_id' => 10]],
+        instances: [['id' => 10, 'databaseinstancetypes_id' => 'MariaDB']],
+    );
+    $expectation = $glpi->shouldReceive('getItem')->once();
+    $throws
+        ? $expectation->andThrow(new RuntimeException('HTTP 404'))
+        : $expectation->andReturn(['id' => 10, '_infocoms' => []]);
+
+    $mercator = databaseTypesMercatorMock();
+
+    $created = null;
+    $mercator->shouldReceive('create')->andReturnUsing(function (string $ep, array $payload) use (&$created) {
+        $created = $payload;
+
+        return ['id' => 99] + $payload;
+    });
+
+    (new GlpiSyncService)->sync($glpi, $mercator, new DatabaseSyncHandler(new DatabaseMapper));
+
+    expect($created)->not->toHaveKey('install_date')
+        ->and($created['type'])->toBe('MariaDB');
+})->with([
+    'pas d\'Infocom' => [false],
+    'instance en erreur' => [true],
+]);

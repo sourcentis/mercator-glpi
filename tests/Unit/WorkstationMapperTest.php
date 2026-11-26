@@ -284,15 +284,43 @@ it('mappe les dates de garantie', function () {
     $result = (new WorkstationMapper)->map(glpiComputer(), ['buildings_map' => []]);
 
     expect($result['purchase_date'])->toBe('2022-03-15');
-    expect($result['warranty_start_date'])->toBe('2022-03-01');
+    // Début de garantie = warranty_date, pas order_date (date de commande).
+    expect($result['warranty_start_date'])->toBe('2022-03-15');
+    // Infocom n'a pas de date de fin : calculée comme GLPI (warranty_date + durée).
     expect($result['warranty_end_date'])->toBe('2025-03-15');
     expect($result['warranty_period'])->toBe('36 mois');
+    expect($result['warranty'])->toBe('ProSupport');
     expect($result['fin_value'])->toBe(1299.0);
+});
+
+it('mappe la mise en service et la réforme Infocom (issue #19)', function () {
+    $result = (new WorkstationMapper)->map(glpiComputer([
+        '_infocoms' => ['use_date' => '2022-04-04 00:00:00', 'decommission_date' => '2027-12-31'],
+    ]), ['buildings_map' => []]);
+
+    expect($result['install_date'])->toBe('2022-04-04')
+        ->and($result['end_of_life_date'])->toBe('2027-12-31');
+});
+
+it('n\'envoie pas de fin de garantie sans date de début, ou pour une garantie à vie', function (array $infocoms) {
+    $result = (new WorkstationMapper)->map(glpiComputer(['_infocoms' => $infocoms]), ['buildings_map' => []]);
+
+    expect($result)->not->toHaveKey('warranty_end_date');
+})->with([
+    'sans warranty_date' => [['warranty_duration' => 36]],
+    'durée nulle' => [['warranty_date' => '2022-03-15', 'warranty_duration' => 0]],
+    'garantie à vie (-1)' => [['warranty_date' => '2022-03-15', 'warranty_duration' => -1]],
+]);
+
+it('affiche une garantie à vie', function () {
+    $result = (new WorkstationMapper)->map(glpiComputer(['_infocoms' => ['warranty_duration' => -1]]), ['buildings_map' => []]);
+
+    expect($result['warranty_period'])->toBe('À vie');
 });
 
 it('ignore les dates à 0000-00-00', function () {
     $computer = glpiComputer([
-        '_infocoms' => ['buy_date' => '0000-00-00', 'warranty_expiration' => '0000-00-00'],
+        '_infocoms' => ['buy_date' => '0000-00-00', 'warranty_date' => '0000-00-00', 'warranty_duration' => 36, 'use_date' => '0000-00-00'],
     ]);
     $result = (new WorkstationMapper)->map($computer, ['buildings_map' => []]);
 

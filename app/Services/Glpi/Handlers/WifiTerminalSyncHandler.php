@@ -2,11 +2,12 @@
 
 namespace App\Services\Glpi\Handlers;
 
+use App\Services\Glpi\Contracts\SupportsGlpiItemDetail;
 use App\Services\Glpi\Contracts\SyncHandler;
 use App\Services\Glpi\Handlers\Concerns\MatchesGlpiDropdownType;
 use App\Services\Glpi\Mappers\WifiTerminalMapper;
 
-class WifiTerminalSyncHandler implements SyncHandler
+class WifiTerminalSyncHandler implements SupportsGlpiItemDetail, SyncHandler
 {
     use MatchesGlpiDropdownType;
 
@@ -28,6 +29,20 @@ class WifiTerminalSyncHandler implements SyncHandler
             'range'             => '0-999',
             'expand_dropdowns'  => 1,
             'with_networkports' => 1,
+        ];
+    }
+
+    /**
+     * Infocom (mise en service, garantie, réforme — issue #19) : with_infocoms n'est
+     * pas fiable sur la requête de collection, il est demandé item par item.
+     * expand_dropdowns=1 pour que la fusion avec l'item de collection conserve les
+     * libellés (fabricant, modèle, lieu…) et non des ids.
+     */
+    public function glpiDetailParams(): array
+    {
+        return [
+            'expand_dropdowns' => 1,
+            'with_infocoms' => 1,
         ];
     }
 

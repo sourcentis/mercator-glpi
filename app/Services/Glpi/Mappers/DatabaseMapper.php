@@ -13,14 +13,19 @@ class DatabaseMapper
     public function map(array $item, array $context): array
     {
         // Type de technologie résolu via la DatabaseInstance parente (cf.
-        // GlpiSyncService::buildDatabaseTypesMap(), SupportsDatabaseInstanceResolution).
+        // GlpiSyncService::buildDatabaseInstanceMaps(), SupportsDatabaseInstanceResolution).
         // Absent du contexte ou vide : la clé 'type' est omise (pas envoyée à null/'')
         // afin de ne jamais écraser une valeur déjà présente côté Mercator.
         $type = $context['database_types'][$item['id']] ?? null;
 
+        // Date de mise en service : Infocom de la DatabaseInstance parente (issue #19),
+        // même résolution que le type. Absente : non envoyée (pas d'écrasement).
+        $installDate = $context['database_install_dates'][$item['id']] ?? null;
+
         return array_filter([
             'name' => $this->padName($item['name'] ?? null),
             'type' => $type !== '' ? $type : null,
+            'install_date' => $installDate,
             'update_source' => 'GLPI',
         ], fn ($v) => $v !== null);
     }
