@@ -3,6 +3,7 @@
 namespace App\Services\Glpi;
 
 use App\Services\Glpi\Concerns\FiltersMercatorPerimeter;
+use App\Services\Glpi\Contracts\DisambiguatesHomonymNames;
 use App\Services\Glpi\Contracts\GlpiClientInterface;
 use App\Services\Glpi\Contracts\SupportsBayResolution;
 use App\Services\Glpi\Contracts\SupportsCustomExtRefsTag;
@@ -10,7 +11,6 @@ use App\Services\Glpi\Contracts\SupportsDatabaseInstanceResolution;
 use App\Services\Glpi\Contracts\SupportsExplicitEntityFilter;
 use App\Services\Glpi\Contracts\SupportsGlpiItemDetail;
 use App\Services\Glpi\Contracts\SupportsGlpiOperatingSystem;
-use App\Services\Glpi\Contracts\SupportsMultipleGlpiIds;
 use App\Services\Glpi\Contracts\SyncHandler;
 use App\Services\Mercator\Contracts\MercatorClientInterface;
 use Illuminate\Support\Facades\Log;
@@ -208,16 +208,27 @@ class GlpiSyncService
         // (en minuscules) ne sert que de filet de sécurité pour les items Mercator
         // pas encore tagués (migration, création manuelle déjà nommée à l'identique).
         //
-        // Handlers SupportsMultipleGlpiIds (ex. Database, cf. issue #17) : plusieurs
-        // items GLPI distincts peuvent légitimement partager le même nom et doivent se
-        // réconcilier sur UN SEUL enregistrement Mercator (Mercator exige un nom unique
-        // par endpoint — créer un doublon échouerait avec un 422 "already been taken").
-        // ext_refs peut alors porter plusieurs tags {GLPI} (ex. "{GLPI}4|{GLPI}80") :
-        // mercByGlpiId indexe l'entrée sous CHACUN de ces id, pas seulement le premier.
-        $tracksMultipleIds = $handler instanceof SupportsMultipleGlpiIds;
+        // Handlers DisambiguatesHomonymNames (ex. Database, cf. issue #17) : des items
+        // GLPI homonymes sont des ressources INDÉPENDANTES, chacune son enregistrement
+        // Mercator. Le repli par nom est restreint aux items Mercator non tagués
+        // ($untaggedByName), et $reservedNames (nom → id Mercator) sert à éviter un 422
+        // "already been taken" lors d'une création ou d'un renommage. Mercator n'imposant
+        // l'unicité des noms que par périmètre, seuls les noms du périmètre cible sont
+        // réservés quand --perimeter est défini (tous sinon).
+        $disambiguates = $handler instanceof DisambiguatesHomonymNames;
 
         $mercByGlpiId = [];
         $mercByName = [];
+        $untaggedByName = [];
+        $reservedNames = [];
+
+        if ($disambiguates) {
+            foreach ($mercatorItems as $item) {
+                if ($perimeterId === null || $this->inPerimeter($item, $perimeterId)) {
+                    $reservedNames[strtolower($item['name'])] = $item['id'];
+                }
+            }
+        }
         // Ordre historique : pour un même tag ext_refs, le dernier item lu l'emporte ; pour
         // un même nom, le premier.
         //
@@ -239,12 +250,15 @@ class GlpiSyncService
                 'perimeter_id' => $item['perimeter_id'] ?? null,
             ];
 
-            $glpiIds = $tracksMultipleIds
-                ? $this->extractGlpiIds($entry['ext_refs'], $extRefsTag)
-                : array_filter([$this->extractGlpiId($entry['ext_refs'], $extRefsTag)], fn ($id) => $id !== null);
-
-            foreach ($glpiIds as $glpiId) {
+            // Un seul tag {GLPI} par enregistrement : un enregistrement fusionné par une
+            // version précédente ("{GLPI}4|{GLPI}80", cf. issue #17) n'est rattaché qu'au
+            // premier id ; buildExtRefs() le ramène à "{GLPI}4" et l'item 80 obtient son
+            // propre enregistrement.
+            $glpiId = $this->extractGlpiId($entry['ext_refs'], $extRefsTag);
+            if ($glpiId !== null) {
                 $mercByGlpiId[(string) $glpiId] = $entry;
+            } elseif ($disambiguates && ! $this->hasForeignGlpiTag($entry['ext_refs'], $extRefsTag)) {
+                $untaggedByName[strtolower($item['name'])] ??= $entry;
             }
 
             $mercByName[strtolower($item['name'])] ??= $entry;
@@ -267,8 +281,29 @@ class GlpiSyncService
         // de charger toutes les DatabaseInstance/Database GLPI en plus de la collection
         // Database déjà chargée à l'étape 1.
         if ($handler instanceof SupportsDatabaseInstanceResolution) {
-            ['types' => $context['database_types'], 'install_dates' => $context['database_install_dates']]
-                = $this->buildDatabaseInstanceMaps($glpi);
+            [
+                'types' => $context['database_types'],
+                'install_dates' => $context['database_install_dates'],
+                'instances' => $context['database_instances'],
+            ] = $this->buildDatabaseInstanceMaps($glpi);
+        }
+
+        // Homonymes GLPI (handlers DisambiguatesHomonymNames) : id GLPI → libellé de
+        // suffixe, calculé une fois pour tout le lot (indépendant de l'ordre de la boucle).
+        $homonymLabels = [];
+
+        if ($disambiguates) {
+            $homonymGroups = $this->groupHomonyms($glpiItems);
+
+            if ($homonymGroups !== [] && $handler instanceof SupportsDatabaseInstanceResolution) {
+                $context['database_hosts'] = $this->resolveDatabaseHostNames(
+                    $glpi,
+                    array_merge(...array_values($homonymGroups)),
+                    $context['database_instances'] ?? []
+                );
+            }
+
+            $homonymLabels = $this->computeHomonymLabels($handler, $homonymGroups, $context);
         }
 
         // ── 6. GLPI → Mercator : créer ou mettre à jour ───────────────────────
@@ -277,16 +312,20 @@ class GlpiSyncService
 
         foreach ($glpiItems as $glpiItem) {
             $glpiId = (string) $glpiItem['id'];
-            $existing = $mercByGlpiId[$glpiId] ?? $mercByName[strtolower($glpiItem['name'])] ?? null;
-            $action = $existing ? 'UPDATE' : 'CREATE';
 
             try {
                 $payload = $handler->map($glpiItem, $context);
-                // Handlers SupportsMultipleGlpiIds (ex. Database, cf. issue #17) : cumule
-                // le tag {GLPI}<id> de ce glpiItem avec ceux déjà présents (au lieu de les
-                // remplacer) — plusieurs items GLPI homonymes réconciliés sur ce même
-                // enregistrement Mercator restent tous traçables dans ext_refs.
-                $payload['ext_refs'] = $this->buildExtRefs($existing['ext_refs'] ?? null, $glpiItem['id'], $extRefsTag, $tracksMultipleIds);
+
+                if ($disambiguates) {
+                    $existing = $this->resolveHomonymSafeMatch(
+                        $endpoint, $glpiItem, $payload, $homonymLabels, $mercByGlpiId, $untaggedByName, $reservedNames
+                    );
+                } else {
+                    $existing = $mercByGlpiId[$glpiId] ?? $mercByName[strtolower($glpiItem['name'])] ?? null;
+                }
+
+                $action = $existing ? 'UPDATE' : 'CREATE';
+                $payload['ext_refs'] = $this->buildExtRefs($existing['ext_refs'] ?? null, $glpiItem['id'], $extRefsTag);
 
                 if ($perimeterId !== null) {
                     $payload['perimeter_id'] = $perimeterId;
@@ -351,10 +390,8 @@ class GlpiSyncService
                     $mercByGlpiId[$glpiId] = $mercEntry;
                     $mercByName[strtolower($glpiItem['name'])] = $mercEntry;
 
-                    if ($tracksMultipleIds) {
-                        foreach ($this->extractGlpiIds($payload['ext_refs'], $extRefsTag) as $id) {
-                            $mercByGlpiId[(string) $id] = $mercEntry;
-                        }
+                    if ($disambiguates && isset($payload['name'])) {
+                        $reservedNames[strtolower($payload['name'])] = $mercId;
                     }
                 }
             } catch (Throwable $e) {
@@ -816,17 +853,15 @@ class GlpiSyncService
      *
      * Réconciliation database↔database et Computer↔serveur logique via ext_refs
      * ({GLPI}<id>) en priorité, nom (lowercase, trim) en repli pour les items
-     * Mercator pas encore tagués (cf. buildMercatorIndexes()).
+     * Mercator pas encore tagués (cf. buildMercatorIndexes()). Pour les databases, ce
+     * repli par nom est réservé aux items Mercator SANS tag {GLPI} et aux noms GLPI
+     * non homonymes : deux bases GLPI homonymes sont indépendantes et ont chacune leur
+     * enregistrement Mercator au nom suffixé (cf. DisambiguatesHomonymNames, issue #17).
      *
      * Remplacement, pas nettoyage global : seules les bases dont l'hôte se résout
      * sont réécrites (pas de passage de nettoyage sur toutes les bases taguées
      * {GLPI}, contrairement à vm_links) — un lien déjà écrit n'est pas retiré si
      * l'hôte cesse de se résoudre à une exécution suivante.
-     *
-     * Plusieurs Database GLPI homonymes (cf. DatabaseSyncHandler::SupportsMultipleGlpiIds,
-     * issue #17) peuvent se réconcilier sur le même enregistrement Mercator : leurs
-     * serveurs logiques hôtes respectifs sont alors ACCUMULÉS et envoyés en une seule
-     * mise à jour (union des liens), pas écrasés les uns par les autres.
      *
      * @return array{updated: int, skipped: int, errors: int}
      */
@@ -933,25 +968,36 @@ class GlpiSyncService
 
         // ── 3. Pour chaque Database : résoudre son serveur logique hôte ────────
 
-        // Plusieurs Database GLPI homonymes peuvent se réconcilier sur le MÊME
-        // enregistrement Mercator (cf. DatabaseSyncHandler::SupportsMultipleGlpiIds,
-        // issue #17) : leurs serveurs logiques hôtes sont donc accumulés ici par id de
-        // database Mercator, puis envoyés en une seule mise à jour (union des liens,
-        // cf. étape 4) — sans quoi chaque PUT écraserait le lien du précédent.
+        // Liens accumulés par id de database Mercator puis envoyés en une seule mise à
+        // jour (étape 4) : garde-fou si deux Database GLPI venaient à se résoudre sur le
+        // même enregistrement (ex. enregistrement encore fusionné "{GLPI}4|{GLPI}80" par
+        // une version précédente, avant le prochain --type=databases) — sans quoi chaque
+        // PUT écraserait le lien du précédent.
         $linksByMercDbId = [];
+
+        // Noms GLPI portés par plusieurs bases (cf. issue #17) : pas de repli par nom
+        // pour ces bases, le nom brut ne désigne aucune d'elles de façon sûre.
+        $homonymNames = array_flip(array_keys($this->groupHomonyms($databases)));
 
         foreach ($databases as $database) {
             $glpiDbId = (string) $database['id'];
-            $db = $this->resolveMercatorMatch(
-                $dbIndex,
-                $glpiDbId,
-                strtolower(trim($database['name'] ?? ''))
-            );
+            $nameKey = strtolower(trim($database['name'] ?? ''));
+            $db = $dbIndex['byGlpiId'][$glpiDbId] ?? null;
+
+            if ($db === null && ! isset($homonymNames[$nameKey])) {
+                $candidate = $dbIndex['byName'][$nameKey] ?? null;
+
+                // Un enregistrement tagué {GLPI}N appartient à la Database GLPI N : il
+                // n'est jamais « volé » par une autre base via son nom.
+                if ($candidate !== null && $this->extractGlpiId($candidate['ext_refs'], '{GLPI}') === null) {
+                    $db = $candidate;
+                }
+            }
 
             if ($db === null) {
                 $stats['skipped']++;
                 $skipReasons['no_mercator_database']++;
-                Log::debug("[database_links] Database GLPI #{$glpiDbId} '{$database['name']}' : aucune database Mercator correspondante (ni ext_refs {GLPI}{$glpiDbId}, ni nom)");
+                Log::debug("[database_links] Database GLPI #{$glpiDbId} '{$database['name']}' : aucune database Mercator correspondante (ni ext_refs {GLPI}{$glpiDbId}, ni nom non ambigu sur un enregistrement non tagué)");
 
                 continue;
             }
@@ -1180,11 +1226,8 @@ class GlpiSyncService
                 'ext_refs' => $item['ext_refs'] ?? null,
             ];
 
-            // extractGlpiIds() (et non extractGlpiId()) : un enregistrement Mercator
-            // fusionné (cf. SupportsMultipleGlpiIds, issue #17) peut porter plusieurs
-            // tags {GLPI} — indexé sous chacun d'eux, sinon inoffensif pour le cas
-            // courant (un seul id) où les deux méthodes sont équivalentes.
-            foreach ($this->extractGlpiIds($entry['ext_refs'], $extRefsTag) as $glpiId) {
+            $glpiId = $this->extractGlpiId($entry['ext_refs'], $extRefsTag);
+            if ($glpiId !== null) {
                 $byGlpiId[(string) $glpiId] = $entry;
             }
 
@@ -1400,8 +1443,16 @@ class GlpiSyncService
      * getItem() par instance réellement référencée, dédupliqué. Une instance en erreur
      * (supprimée, droits…) est ignorée sans faire échouer le run.
      *
-     * @return array{types: array<int, string>, install_dates: array<int, string>}
-     *               id GLPI de la Database → nom du type / date « Y-m-d »
+     * Indexe enfin, pour chaque Database, le nom de sa DatabaseInstance et la référence
+     * de son hôte (itemtype/items_id, absents de la collection mais présents dans le
+     * getItem() ci-dessus) : de quoi distinguer deux bases homonymes (issue #17, cf.
+     * resolveDatabaseHostNames() / DatabaseSyncHandler::homonymLabels()).
+     *
+     * @return array{
+     *     types: array<int, string>,
+     *     install_dates: array<int, string>,
+     *     instances: array<int, array{name: ?string, itemtype: ?string, items_id: int}>,
+     * } id GLPI de la Database → nom du type / date « Y-m-d » / instance parente
      */
     private function buildDatabaseInstanceMaps(GlpiClientInterface $glpi): array
     {
@@ -1410,8 +1461,10 @@ class GlpiSyncService
         $instances = $glpi->getItems('DatabaseInstance', ['range' => '0-999', 'expand_dropdowns' => 1]);
 
         $typeByInstanceId = [];
+        $nameByInstanceId = [];
         foreach ($instances as $instance) {
             $typeByInstanceId[(int) $instance['id']] = trim((string) ($instance['databaseinstancetypes_id'] ?? ''));
+            $nameByInstanceId[(int) $instance['id']] = trim((string) ($instance['name'] ?? ''));
         }
 
         // expand_dropdowns=0 : databaseinstances_id doit rester l'id GLPI numérique pour
@@ -1432,6 +1485,8 @@ class GlpiSyncService
 
         $installDateByInstanceId = [];
         $installDateByDbId = [];
+        $instanceInfoById = [];
+        $instanceByDbId = [];
         foreach ($databases as $database) {
             $instanceId = (int) ($database['databaseinstances_id'] ?? 0);
 
@@ -1442,6 +1497,11 @@ class GlpiSyncService
             if (! array_key_exists($instanceId, $installDateByInstanceId)) {
                 try {
                     $instance = $glpi->getItem('DatabaseInstance', $instanceId, ['expand_dropdowns' => 0, 'with_infocoms' => 1]);
+                    $instanceInfoById[$instanceId] = [
+                        'name' => trim((string) ($instance['name'] ?? '')) ?: null,
+                        'itemtype' => is_string($instance['itemtype'] ?? null) ? $instance['itemtype'] : null,
+                        'items_id' => (int) ($instance['items_id'] ?? 0),
+                    ];
                     $useDate = $instance['_infocoms']['use_date'] ?? null;
                     $installDateByInstanceId[$instanceId] = is_string($useDate) && $useDate !== '' && ! str_starts_with($useDate, '0000-00-00')
                         ? substr($useDate, 0, 10)
@@ -1455,11 +1515,197 @@ class GlpiSyncService
             if ($installDateByInstanceId[$instanceId] !== null) {
                 $installDateByDbId[(int) $database['id']] = $installDateByInstanceId[$instanceId];
             }
+
+            $info = $instanceInfoById[$instanceId] ?? ['name' => null, 'itemtype' => null, 'items_id' => 0];
+            $info['name'] ??= ($nameByInstanceId[$instanceId] ?? '') ?: null;
+            $instanceByDbId[(int) $database['id']] = $info;
         }
 
         Log::info('[databases] '.count($installDateByDbId).' date(s) de mise en service résolues via DatabaseInstance');
 
-        return ['types' => $typeByDbId, 'install_dates' => $installDateByDbId];
+        return ['types' => $typeByDbId, 'install_dates' => $installDateByDbId, 'instances' => $instanceByDbId];
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers — homonymes (DisambiguatesHomonymNames, cf. issue #17)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Regroupe les items GLPI portant le même nom (insensible à la casse et aux
+     * espaces de bord). Seuls les groupes d'au moins deux items sont renvoyés.
+     *
+     * @return array<string, array<int, array>> nom normalisé → items homonymes
+     */
+    private function groupHomonyms(array $glpiItems): array
+    {
+        $groups = [];
+        foreach ($glpiItems as $item) {
+            $groups[strtolower(trim((string) ($item['name'] ?? '')))][] = $item;
+        }
+
+        return array_filter($groups, fn ($group, $name) => $name !== '' && count($group) > 1, ARRAY_FILTER_USE_BOTH);
+    }
+
+    /**
+     * Nom de l'hôte (Computer…) de la DatabaseInstance de chaque Database fournie.
+     * Appelé pour les seules bases homonymes : un getItem() par hôte distinct, mis en
+     * cache ; un hôte introuvable est ignoré (le libellé se rabat sur l'instance).
+     *
+     * @param  array<int, array{name: ?string, itemtype: ?string, items_id: int}>  $instancesByDbId
+     * @return array<int, string> id GLPI de la Database → nom de l'hôte
+     */
+    private function resolveDatabaseHostNames(GlpiClientInterface $glpi, array $databases, array $instancesByDbId): array
+    {
+        $hostNames = [];
+        $cache = [];
+
+        foreach ($databases as $database) {
+            $dbId = (int) $database['id'];
+            $itemtype = $instancesByDbId[$dbId]['itemtype'] ?? null;
+            $itemsId = (int) ($instancesByDbId[$dbId]['items_id'] ?? 0);
+
+            if ($itemtype === null || $itemtype === '' || $itemsId === 0) {
+                continue;
+            }
+
+            $key = "{$itemtype}#{$itemsId}";
+
+            if (! array_key_exists($key, $cache)) {
+                try {
+                    $cache[$key] = trim((string) ($glpi->getItem($itemtype, $itemsId)['name'] ?? '')) ?: null;
+                } catch (Throwable $e) {
+                    $cache[$key] = null;
+                    Log::warning("[databases] Hôte {$key} : nom non récupéré — ".$e->getMessage());
+                }
+            }
+
+            if ($cache[$key] !== null) {
+                $hostNames[$dbId] = $cache[$key];
+            }
+        }
+
+        return $hostNames;
+    }
+
+    /**
+     * Choisit, pour chaque groupe d'homonymes, le libellé de suffixe de chaque item :
+     * le premier niveau de DisambiguatesHomonymNames::homonymLabels() qui donne des
+     * libellés deux à deux distincts dans le groupe (un item sans libellé à ce niveau
+     * prend "#<id GLPI>"), sinon "#<id GLPI>" pour tous. Indépendant de l'ordre des items.
+     *
+     * @param  array<string, array<int, array>>  $homonymGroups
+     * @return array<string, string> id GLPI → libellé (sans parenthèses)
+     */
+    private function computeHomonymLabels(DisambiguatesHomonymNames $handler, array $homonymGroups, array $context): array
+    {
+        $labels = [];
+
+        foreach ($homonymGroups as $group) {
+            $candidates = [];
+            foreach ($group as $item) {
+                $candidates[(string) $item['id']] = array_values(array_map(
+                    fn ($label) => trim((string) $label),
+                    $handler->homonymLabels($item, $context)
+                ));
+            }
+
+            $levels = max(array_map('count', $candidates));
+            $chosen = null;
+
+            for ($level = 0; $level < $levels && $chosen === null; $level++) {
+                $attempt = [];
+                foreach ($candidates as $id => $list) {
+                    $label = $list[$level] ?? '';
+                    $attempt[$id] = $label !== '' ? $label : '#'.$id;
+                }
+
+                if (count(array_unique(array_map('strtolower', $attempt))) === count($attempt)) {
+                    $chosen = $attempt;
+                }
+            }
+
+            foreach ($candidates as $id => $_) {
+                $labels[$id] = $chosen[$id] ?? '#'.$id;
+            }
+        }
+
+        return $labels;
+    }
+
+    /**
+     * Réconciliation et nommage d'un item d'un handler DisambiguatesHomonymNames :
+     *  1. suffixe le nom du payload si l'item a des homonymes GLPI (ex. "prod (srv-a)") ;
+     *  2. cherche l'enregistrement Mercator par ext_refs, puis par nom (final) parmi les
+     *     seuls enregistrements non tagués ;
+     *  3. si le nom voulu est déjà pris par un AUTRE enregistrement Mercator, ajoute
+     *     l'id GLPI ("prod (#80)") pour éviter un 422 "already been taken".
+     * Le nom finalement retenu est réservé pour la suite du run.
+     *
+     * @return array|null enregistrement Mercator existant, null s'il faut le créer
+     */
+    private function resolveHomonymSafeMatch(
+        string $endpoint,
+        array $glpiItem,
+        array &$payload,
+        array $homonymLabels,
+        array $mercByGlpiId,
+        array &$untaggedByName,
+        array &$reservedNames,
+    ): ?array {
+        $glpiId = (string) $glpiItem['id'];
+
+        if (isset($payload['name'], $homonymLabels[$glpiId])) {
+            $payload['name'] = $this->withNameSuffix($payload['name'], $homonymLabels[$glpiId]);
+            Log::info("[{$endpoint}] Homonyme GLPI : {$glpiItem['name']} (GLPI #{$glpiId}) → \"{$payload['name']}\"");
+        }
+
+        $existing = $mercByGlpiId[$glpiId] ?? null;
+
+        if ($existing === null && isset($payload['name'])) {
+            $existing = $untaggedByName[strtolower($payload['name'])] ?? null;
+
+            if ($existing !== null) {
+                unset($untaggedByName[strtolower($payload['name'])]);
+            }
+        }
+
+        if (isset($payload['name'])) {
+            $owner = $reservedNames[strtolower($payload['name'])] ?? null;
+
+            if ($owner !== null && $owner !== ($existing['id'] ?? null)) {
+                $base = $payload['name'];
+                $payload['name'] = $this->withNameSuffix($payload['name'], '#'.$glpiId);
+                Log::warning("[{$endpoint}] Nom \"{$base}\" déjà pris dans Mercator (#{$owner}) → GLPI #{$glpiId} renommé \"{$payload['name']}\"");
+            }
+
+            if ($existing !== null) {
+                $currentName = strtolower($existing['name']);
+                if (($reservedNames[$currentName] ?? null) === $existing['id']) {
+                    unset($reservedNames[$currentName]);
+                }
+            }
+
+            $reservedNames[strtolower($payload['name'])] = $existing['id'] ?? 'pending:'.$glpiId;
+        }
+
+        return $existing;
+    }
+
+    /**
+     * Ajoute " (<label>)" à un nom en tronquant la partie de base si nécessaire pour
+     * respecter la longueur maximale d'un nom Mercator (64 caractères).
+     */
+    private function withNameSuffix(string $name, string $label): string
+    {
+        $suffix = " ({$label})";
+        $room = 64 - mb_strlen($suffix);
+
+        if ($room < 3) {
+            $suffix = mb_substr($suffix, 0, 61);
+            $room = 3;
+        }
+
+        return rtrim(mb_substr($name, 0, $room)).$suffix;
     }
 
     /**
@@ -1475,26 +1721,6 @@ class GlpiSyncService
         preg_match('/'.preg_quote($tag, '/').'(\d+)/', $extRefs, $matches);
 
         return isset($matches[1]) ? (int) $matches[1] : null;
-    }
-
-    /**
-     * Extrait TOUS les identifiants GLPI portés par un tag donné (ex. "{GLPI}" ou
-     * "{GLPI-Appliance}") depuis ext_refs. Un enregistrement Mercator fusionné (cf.
-     * SupportsMultipleGlpiIds, issue #17) peut porter plusieurs tags {GLPI} distincts
-     * (ex. "{GLPI}4|{GLPI}80") : là où extractGlpiId() ne renvoie que le premier, cette
-     * méthode les renvoie tous.
-     *
-     * @return array<int>
-     */
-    private function extractGlpiIds(?string $extRefs, string $tag = '{GLPI}'): array
-    {
-        if (! $extRefs) {
-            return [];
-        }
-
-        preg_match_all('/'.preg_quote($tag, '/').'(\d+)/', $extRefs, $matches);
-
-        return array_map('intval', $matches[1] ?? []);
     }
 
     /**
@@ -1529,42 +1755,20 @@ class GlpiSyncService
      * handler ({GLPI}id par défaut) tout en préservant les éventuelles références
      * d'autres sources — y compris les tags {GLPI...} d'un AUTRE handler (format
      * différent de $tag, cf. SupportsCustomExtRefsTag, issue #12).
-     *
-     * $mergeMultiple (handlers SupportsMultipleGlpiIds, ex. Database, cf. issue #17) :
-     * CUMULE le nouveau tag {GLPI}<glpiId> avec ceux déjà présents au lieu de les
-     * remplacer — plusieurs items GLPI homonymes réconciliés sur le même enregistrement
-     * Mercator restent ainsi tous traçables (ex. "{GLPI}4|{GLPI}80"), au lieu de perdre
-     * le précédent à chaque synchronisation.
      */
-    private function buildExtRefs(?string $existingExtRefs, int|string $glpiId, string $tag = '{GLPI}', bool $mergeMultiple = false): string
+    private function buildExtRefs(?string $existingExtRefs, int|string $glpiId, string $tag = '{GLPI}'): string
     {
         $otherRefs = [];
-        $tagRefs = [];
 
         if ($existingExtRefs) {
             foreach (explode('|', $existingExtRefs) as $ref) {
                 $ref = trim($ref);
-                if ($ref === '') {
-                    continue;
-                }
-                if (str_starts_with($ref, $tag)) {
-                    $tagRefs[] = $ref;
-                } else {
+                if ($ref !== '' && ! str_starts_with($ref, $tag)) {
                     $otherRefs[] = $ref;
                 }
             }
         }
 
-        $newRef = $tag.$glpiId;
-
-        if ($mergeMultiple) {
-            if (! in_array($newRef, $tagRefs, true)) {
-                $tagRefs[] = $newRef;
-            }
-        } else {
-            $tagRefs = [$newRef];
-        }
-
-        return implode('|', array_merge($otherRefs, $tagRefs));
+        return implode('|', array_merge($otherRefs, [$tag.$glpiId]));
     }
 }
