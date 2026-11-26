@@ -2,13 +2,13 @@
 
 namespace App\Services\Glpi\Handlers;
 
+use App\Services\Glpi\Contracts\DisambiguatesHomonymNames;
 use App\Services\Glpi\Contracts\SupportsDatabaseInstanceResolution;
-use App\Services\Glpi\Contracts\SupportsMultipleGlpiIds;
 use App\Services\Glpi\Contracts\SyncHandler;
 use App\Services\Glpi\Mappers\DatabaseMapper;
 use Illuminate\Support\Facades\Log;
 
-class DatabaseSyncHandler implements SupportsDatabaseInstanceResolution, SupportsMultipleGlpiIds, SyncHandler
+class DatabaseSyncHandler implements DisambiguatesHomonymNames, SupportsDatabaseInstanceResolution, SyncHandler
 {
     public function __construct(private readonly DatabaseMapper $mapper) {}
 
@@ -60,5 +60,25 @@ class DatabaseSyncHandler implements SupportsDatabaseInstanceResolution, Support
     public function map(array $glpiItem, array $context): array
     {
         return $this->mapper->map($glpiItem, $context);
+    }
+
+    /**
+     * Deux bases homonymes sont distinguées par leur hôte (serveur de la DatabaseInstance),
+     * puis par "hôte / instance" si elles partagent le même hôte (ex. une base "glpi" sur
+     * une instance MariaDB et une autre sur une instance PostgreSQL du même serveur).
+     * Sans hôte résolu, le nom de l'instance seul sert de libellé.
+     * cf. GlpiSyncService::buildDatabaseInstanceMaps() / resolveDatabaseHostNames().
+     */
+    public function homonymLabels(array $glpiItem, array $context): array
+    {
+        $id = (int) ($glpiItem['id'] ?? 0);
+        $host = trim((string) ($context['database_hosts'][$id] ?? ''));
+        $instance = trim((string) ($context['database_instances'][$id]['name'] ?? ''));
+
+        if ($host === '') {
+            return [$instance];
+        }
+
+        return [$host, $instance !== '' ? "{$host} / {$instance}" : null];
     }
 }

@@ -371,20 +371,21 @@ it('applique le filtre is_active (GLPI_SYNC_ONLY_ACTIVE_DATABASES) aux liens com
     expect($stats['updated'])->toBe(1);
 });
 
-it('cumule les serveurs logiques de plusieurs Database GLPI homonymes réconciliées sur la même database Mercator en une seule mise à jour', function () {
-    // cf. issue #17, suite : deux Database GLPI nommées "prod" (instances/hôtes
-    // différents) se réconcilient désormais sur LE MÊME enregistrement Mercator
-    // (SupportsMultipleGlpiIds) — leurs serveurs logiques hôtes doivent donc être
-    // cumulés dans un seul PUT, pas s'écraser l'un l'autre au fil de la boucle.
+it('lie chaque Database GLPI homonyme à son propre serveur logique, sur son propre enregistrement Mercator', function () {
+    // cf. issue #17 : deux bases "prod" sur des hôtes différents sont indépendantes —
+    // chacune a son enregistrement Mercator (nom suffixé par l'hôte, tag {GLPI} propre).
     $updated = [];
     $mercator = databaseLinksMercatorMock(
-        [['id' => 500, 'name' => 'prod', 'ext_refs' => '{GLPI}4|{GLPI}80']],
+        [
+            ['id' => 500, 'name' => 'prod (srv-a)', 'ext_refs' => '{GLPI}4'],
+            ['id' => 501, 'name' => 'prod (srv-b)', 'ext_refs' => '{GLPI}80'],
+        ],
         [
             ['id' => 300, 'name' => 'srv-a', 'ext_refs' => '{GLPI}55'],
             ['id' => 301, 'name' => 'srv-b', 'ext_refs' => '{GLPI}56'],
         ],
     );
-    $mercator->shouldReceive('update')->once()->andReturnUsing(function (string $ep, int $id, array $payload) use (&$updated) {
+    $mercator->shouldReceive('update')->twice()->andReturnUsing(function (string $ep, int $id, array $payload) use (&$updated) {
         $updated[$id] = $payload;
 
         return [];
@@ -403,8 +404,33 @@ it('cumule les serveurs logiques de plusieurs Database GLPI homonymes réconcili
 
     $stats = (new GlpiSyncService)->syncDatabaseLinks($glpi, $mercator);
 
-    expect($updated)->toHaveCount(1);
-    expect($updated[500])->toBe(['name' => 'prod', 'logical_servers' => [300, 301]]);
-    expect($stats['updated'])->toBe(1);
-    expect($stats['errors'])->toBe(0);
+    expect($updated[500])->toBe(['name' => 'prod (srv-a)', 'logical_servers' => [300]])
+        ->and($updated[501])->toBe(['name' => 'prod (srv-b)', 'logical_servers' => [301]])
+        ->and($stats['updated'])->toBe(2)
+        ->and($stats['errors'])->toBe(0);
+});
+
+it('ne résout pas par nom une Database GLPI homonyme, ni vers un enregistrement tagué d\'une autre base', function () {
+    $mercator = databaseLinksMercatorMock(
+        [
+            ['id' => 500, 'name' => 'prod', 'ext_refs' => null],
+            ['id' => 501, 'name' => 'solo', 'ext_refs' => '{GLPI}7'],
+        ],
+        [['id' => 300, 'name' => 'srv-a', 'ext_refs' => '{GLPI}55']],
+    );
+    $mercator->shouldNotReceive('update');
+
+    $glpi = databaseLinksGlpiMock(
+        databases: [
+            ['id' => 4, 'name' => 'prod', 'databaseinstances_id' => 40],
+            ['id' => 80, 'name' => 'prod', 'databaseinstances_id' => 40],
+            ['id' => 9, 'name' => 'solo', 'databaseinstances_id' => 40],
+        ],
+        instances: [['id' => 40, 'itemtype' => 'Computer', 'items_id' => 55]],
+    );
+
+    $stats = (new GlpiSyncService)->syncDatabaseLinks($glpi, $mercator);
+
+    expect($stats['updated'])->toBe(0)
+        ->and($stats['skipped'])->toBe(3);
 });
