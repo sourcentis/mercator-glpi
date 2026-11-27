@@ -726,8 +726,9 @@ class GlpiSyncService
     }
 
     /**
-     * Synchronise les liens application↔serveur logique depuis GLPI vers Mercator,
-     * via les Computer rattachés à chaque Appliance GLPI (cf. issue #12, suite).
+     * Synchronise les liens application↔serveur logique et application↔database
+     * depuis GLPI vers Mercator, via les Computer (cf. issue #12, suite) et les
+     * Database (cf. issue #17) rattachés à chaque Appliance GLPI.
      *
      * Ne s'exécute utilement qu'en mode GLPI_APPLIANCE_MERCATOR_ENDPOINT=applications
      * (sans quoi il n'existe pas d'application Mercator issue d'une Appliance à lier).
@@ -774,7 +775,10 @@ class GlpiSyncService
             count($logicalServerItems),
         ));
 
-        // ── 3. Pour chaque Appliance : lier son application à ses serveurs logiques ──
+        // ── 3. Pour chaque Appliance : lier son application à ses serveurs logiques
+        //       et à ses bases de données ──────────────────────────────────────
+
+        $dbResolver = null;
 
         foreach ($appliances as $appliance) {
             $app = $this->resolveMercatorMatch(
@@ -790,10 +794,13 @@ class GlpiSyncService
                 continue;
             }
 
-            $computerPivotRows = $this->fetchApplianceLinkedItems($glpi, (int) $appliance['id'], 'Computer');
+            // Un seul appel pivot par Appliance, filtré ensuite localement par itemtype.
+            $pivotRows = $this->fetchAppliancePivotRows($glpi, (int) $appliance['id']);
+            $computerPivotRows = $this->filterPivotRows($pivotRows, 'Computer');
+            $databasePivotRows = $this->filterPivotRows($pivotRows, 'Database');
 
-            if (empty($computerPivotRows)) {
-                Log::debug("[appliance_links] Appliance sans Computer lié : {$appliance['name']}");
+            if (empty($computerPivotRows) && empty($databasePivotRows)) {
+                Log::debug("[appliance_links] Appliance sans Computer ni Database lié : {$appliance['name']}");
 
                 continue;
             }
@@ -812,25 +819,56 @@ class GlpiSyncService
                 $logicalServerIds[] = $ls['id'];
             }
 
-            if (empty($logicalServerIds)) {
+            // Bases liées directement à l'Appliance (Appliance_Item itemtype=Database,
+            // cf. issue #17) : chargement GLPI/Mercator paresseux, au premier pivot
+            // Database rencontré — rien n'est chargé si aucune Appliance n'en a.
+            $databaseIds = [];
+
+            if ($databasePivotRows !== []) {
+                $dbResolver ??= $this->buildApplianceDatabaseResolver($glpi, $mercator, $perimeterId);
+
+                foreach ($databasePivotRows as $pivotRow) {
+                    $db = $this->resolveApplianceDatabase($dbResolver, $pivotRow);
+
+                    if ($db === null) {
+                        Log::debug('[appliance_links] Database (items_id='.($pivotRow['items_id'] ?? '?').") liée à l'appliance {$appliance['name']} sans database Mercator correspondante");
+
+                        continue;
+                    }
+
+                    $databaseIds[] = $db['id'];
+                }
+            }
+
+            // Chaque relation n'est envoyée que si elle a au moins un lien résolu : l'API
+            // Mercator ne synchronise que les relations présentes dans le payload
+            // ($request->has()), les autres sont laissées intactes.
+            $payload = ['name' => $app['name']];
+
+            if ($logicalServerIds !== []) {
+                $payload['logical_servers'] = array_values(array_unique($logicalServerIds));
+            }
+
+            if ($databaseIds !== []) {
+                $payload['databases'] = array_values(array_unique($databaseIds));
+            }
+
+            if (count($payload) === 1) {
                 continue;
             }
 
-            $uniqueIds = array_values(array_unique($logicalServerIds));
-
             try {
                 if (! $dryRun) {
-                    $mercator->update('applications', $app['id'], [
-                        'name' => $app['name'],
-                        'logical_servers' => $uniqueIds,
-                    ]);
+                    $mercator->update('applications', $app['id'], $payload);
                 }
                 $stats['updated']++;
                 Log::info(sprintf(
-                    '[appliance_links] %s → %d serveur(s) logique(s) : [%s]',
+                    '[appliance_links] %s → %d serveur(s) logique(s) : [%s], %d database(s) : [%s]',
                     $app['name'],
-                    count($uniqueIds),
-                    implode(', ', $uniqueIds),
+                    count($payload['logical_servers'] ?? []),
+                    implode(', ', $payload['logical_servers'] ?? []),
+                    count($payload['databases'] ?? []),
+                    implode(', ', $payload['databases'] ?? []),
                 ));
             } catch (Throwable $e) {
                 $stats['errors']++;
@@ -894,19 +932,7 @@ class GlpiSyncService
         // les liens ne doivent porter que sur les bases retenues par --type=databases,
         // sans quoi database_links tente de lier des bases exclues du sync principal
         // (pas de database Mercator correspondante → "ignorée", cf. skipReasons ci-dessus).
-        if (config('glpi.sync.only_active_databases', false)) {
-            $before = count($databases);
-            $databases = array_values(array_filter($databases, function ($item) {
-                if (! array_key_exists('is_active', $item)) {
-                    Log::warning('[database_links] GLPI_SYNC_ONLY_ACTIVE_DATABASES=true mais champ is_active absent — base "'.($item['name'] ?? '?').'" conservée');
-
-                    return true;
-                }
-
-                return (int) $item['is_active'] === 1;
-            }));
-            Log::debug('[database_links] Filtre is_active : '.($before - count($databases)).' base(s) exclue(s), '.count($databases).' conservée(s)');
-        }
+        $databases = $this->filterActiveDatabases($databases, '[database_links]');
 
         Log::debug('[database_links] Database bruts reçus de GLPI : '.json_encode(array_map(
             fn ($d) => ['id' => $d['id'] ?? null, 'name' => $d['name'] ?? null, 'databaseinstances_id' => $d['databaseinstances_id'] ?? null],
@@ -1266,25 +1292,148 @@ class GlpiSyncService
      * réel — cf. issue #12, rapport "Appliance sans Computer lié" alors que le lien
      * existe bien côté GLPI).
      *
-     * Conçu pour être réutilisable au-delà de Computer/Software (physical servers,
-     * databases, clusters — non implémenté dans cette itération) : il suffit de
-     * changer $itemType.
+     * Réutilisable pour d'autres itemtypes (Computer, Software, Database…) : il
+     * suffit de changer $itemType.
      *
      * @return array<int, array{id: int, appliances_id: int, items_id: int, itemtype: string}>
      */
     private function fetchApplianceLinkedItems(GlpiClientInterface $glpi, int $applianceId, string $itemType): array
+    {
+        return $this->filterPivotRows($this->fetchAppliancePivotRows($glpi, $applianceId), $itemType);
+    }
+
+    /**
+     * Toutes les lignes pivot Appliance_Item d'une Appliance, tous itemtypes
+     * confondus (cf. fetchApplianceLinkedItems() pour le format et expand_dropdowns=0).
+     *
+     * @return array<int, array{id: int, appliances_id: int, items_id: int, itemtype: string}>
+     */
+    private function fetchAppliancePivotRows(GlpiClientInterface $glpi, int $applianceId): array
     {
         $pivotRows = $glpi->getSubItems('Appliance', $applianceId, 'Appliance_Item', [
             'range' => '0-999',
             'expand_dropdowns' => 0,
         ]);
 
-        Log::debug("[Appliance/{$applianceId}] Appliance_Item : ".count($pivotRows).' ligne(s) pivot reçue(s) au total, filtre itemtype='.$itemType);
+        Log::debug("[Appliance/{$applianceId}] Appliance_Item : ".count($pivotRows).' ligne(s) pivot reçue(s) au total');
 
+        return $pivotRows;
+    }
+
+    private function filterPivotRows(array $pivotRows, string $itemType): array
+    {
         return array_values(array_filter(
             $pivotRows,
             fn ($row) => ($row['itemtype'] ?? null) === $itemType
         ));
+    }
+
+    /**
+     * Données nécessaires pour résoudre une Database GLPI liée à une Appliance vers
+     * sa database Mercator (cf. resolveApplianceDatabase()).
+     *
+     * @return array{index: array, glpiById: array<string, array>, homonyms: array<string, int>}
+     */
+    private function buildApplianceDatabaseResolver(
+        GlpiClientInterface $glpi,
+        MercatorClientInterface $mercator,
+        ?int $perimeterId,
+    ): array {
+        $databases = $this->filterActiveDatabases(
+            $glpi->getItems('Database', ['range' => '0-999', 'expand_dropdowns' => 0]),
+            '[appliance_links]'
+        );
+
+        $glpiById = [];
+        foreach ($databases as $database) {
+            $glpiById[(string) $database['id']] = $database;
+        }
+
+        $dbItems = $this->onlyPerimeter($mercator->getAll('databases'), $perimeterId);
+
+        Log::info(sprintf(
+            '[appliance_links] %d databases GLPI retenues, %d databases Mercator',
+            count($glpiById),
+            count($dbItems),
+        ));
+
+        return [
+            'index' => $this->buildMercatorIndexes($dbItems, '{GLPI}'),
+            'glpiById' => $glpiById,
+            'homonyms' => array_flip(array_keys($this->groupHomonyms($databases))),
+        ];
+    }
+
+    /**
+     * Database Mercator correspondant à une ligne pivot Appliance_Item itemtype=Database.
+     *
+     * Mêmes règles que syncDatabaseLinks() : la base doit faire partie des bases
+     * retenues par --type=databases (filtre is_active), ext_refs {GLPI}<id> en
+     * priorité, repli par nom réservé aux noms GLPI non homonymes et aux
+     * enregistrements Mercator non tagués — deux bases homonymes sont indépendantes
+     * et portent un nom suffixé côté Mercator (cf. DisambiguatesHomonymNames, issue #17).
+     */
+    private function resolveApplianceDatabase(array $resolver, array $pivotRow): ?array
+    {
+        $itemsId = $pivotRow['items_id'] ?? null;
+
+        if (! is_numeric($itemsId)) {
+            return null;
+        }
+
+        $glpiId = (string) (int) $itemsId;
+        $database = $resolver['glpiById'][$glpiId] ?? null;
+
+        if ($database === null) {
+            Log::debug("[appliance_links] Database #{$glpiId} absente des bases GLPI retenues (inactive, hors entité ou supprimée)");
+
+            return null;
+        }
+
+        $match = $resolver['index']['byGlpiId'][$glpiId] ?? null;
+
+        if ($match !== null) {
+            return $match;
+        }
+
+        $nameKey = strtolower(trim((string) ($database['name'] ?? '')));
+
+        if ($nameKey === '' || isset($resolver['homonyms'][$nameKey])) {
+            return null;
+        }
+
+        $candidate = $resolver['index']['byName'][$nameKey] ?? null;
+
+        if ($candidate !== null && $this->extractGlpiId($candidate['ext_refs'], '{GLPI}') === null) {
+            return $candidate;
+        }
+
+        return null;
+    }
+
+    /**
+     * Filtre "is_active" de DatabaseSyncHandler::filterItem() (GLPI_SYNC_ONLY_ACTIVE_DATABASES,
+     * cf. issue #17), partagé par les synchronisations de liens portant sur des Database.
+     */
+    private function filterActiveDatabases(array $databases, string $logPrefix): array
+    {
+        if (! config('glpi.sync.only_active_databases', false)) {
+            return $databases;
+        }
+
+        $before = count($databases);
+        $databases = array_values(array_filter($databases, function ($item) use ($logPrefix) {
+            if (! array_key_exists('is_active', $item)) {
+                Log::warning("{$logPrefix} GLPI_SYNC_ONLY_ACTIVE_DATABASES=true mais champ is_active absent — base \"".($item['name'] ?? '?').'" conservée');
+
+                return true;
+            }
+
+            return (int) $item['is_active'] === 1;
+        }));
+        Log::debug("{$logPrefix} Filtre is_active : ".($before - count($databases)).' base(s) exclue(s), '.count($databases).' conservée(s)');
+
+        return $databases;
     }
 
     /**

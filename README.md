@@ -416,7 +416,7 @@ Certains types doivent être synchronisés avant d'autres pour que les liens et 
 15. physical_servers            ┘
 16. links                       → lie les workstations ↔ applications (nécessite 4 et 6)
 17. activity_links               → lie les activities ↔ applications (nécessite 4 et 5)
-18. appliance_links              → lie les applications ↔ serveurs logiques (nécessite 5 en mode applications et 14)
+18. appliance_links              → lie les applications ↔ serveurs logiques / databases (nécessite 5 en mode applications, 14 et databases)
 19. database_links               → lie les databases ↔ serveur logique hôte (nécessite databases et 14)
 20. vm_links (GLPI_SYNC_VM_LINKS) → lie les serveurs logiques (VM) ↔ serveurs physiques hôtes (nécessite 14 et 15)
 ```
@@ -519,7 +519,7 @@ php application glpi:sync --type=logical_servers --type=physical_servers
 | `databases` | `Database` (pas dans la sync complète par défaut, filtrée par `GLPI_SYNC_ONLY_ACTIVE_DATABASES`) — `type` résolu via `DatabaseInstance.databaseinstancetypes_id` | `databases` | actifs |
 | `links` | `Computer_SoftwareVersion` | pivot `workstation_application` | liens |
 | `activity_links` | `Appliance_Item` (itemtype=Software) | pivot `activity_application` | liens |
-| `appliance_links` | `Appliance_Item` (itemtype=Computer) | `applications.logical_servers` | liens (mode `applications` uniquement) |
+| `appliance_links` | `Appliance_Item` (itemtype=Computer, Database) | `applications.logical_servers`, `applications.databases` | liens (mode `applications` uniquement) |
 | `database_links` | `DatabaseInstance.itemtype`/`items_id` (hôte, itemtype=Computer uniquement, pas dans la sync complète par défaut) | `databases.logical_servers` | liens |
 
 ### Détail des champs par type
@@ -786,18 +786,21 @@ Source GLPI : pivot `Appliance_Item` filtré sur `itemtype=Software` (logiciels 
 
 **Résolution de la localisation** : le champ `locations_id` GLPI (nom de bâtiment ou salle) est mis en correspondance par nom (insensible à la casse) avec les bâtiments Mercator. Si le nom correspond, `building_id` et `site_id` sont renseignés automatiquement. Il est donc recommandé de synchroniser `locations` en premier.
 
-#### Liens application ↔ serveur logique (`appliance_links`)
+#### Liens application ↔ serveur logique / database (`appliance_links`)
 
-Pour chaque Appliance GLPI ayant une application Mercator correspondante (`GLPI_APPLIANCE_MERCATOR_ENDPOINT=applications`), récupère individuellement ses `Computer` liés depuis GLPI via le sous-endpoint `Appliance/{id}/Appliance_Item` et met à jour le champ `logical_servers` du pivot côté application.
+Pour chaque Appliance GLPI ayant une application Mercator correspondante (`GLPI_APPLIANCE_MERCATOR_ENDPOINT=applications`), récupère individuellement ses éléments liés depuis GLPI via le sous-endpoint `Appliance/{id}/Appliance_Item` et met à jour, en un seul `PUT`, les champs `logical_servers` (`Computer` liés) et `databases` (`Database` liées) de l'application.
 
 Source GLPI : pivot `Appliance_Item` filtré sur `itemtype=Computer` (ordinateurs directement rattachés à l'appliance dans GLPI). La correspondance appliance ↔ application se fait via `ext_refs` (`{GLPI-Appliance}<id>`, tag propre au mode `applications` — cf. `SupportsCustomExtRefsTag`) en priorité, nom en repli ; la correspondance Computer ↔ serveur logique via `ext_refs` (`{GLPI}<id>`) en priorité, nom en repli (repli nécessitant un appel GLPI complémentaire, cf. note sur `activity_links` ci-dessus).
+
+**Bases de données** (cf. issue #17) : les `Database` rattachées directement à l'Appliance (onglet « Éléments liés » → Base de données) sont liées à l'application. Seule la base elle-même est prise en compte, pas la `DatabaseInstance` : une instance peut héberger plusieurs bases utilisées par des applications différentes. La correspondance Database ↔ database Mercator suit les mêmes règles que `database_links` : `ext_refs` (`{GLPI}<id>`) en priorité, repli par nom réservé aux noms GLPI non homonymes et aux enregistrements Mercator non tagués (les bases homonymes, suffixées par leur hôte côté Mercator, se résolvent par `ext_refs`), et filtre `GLPI_SYNC_ONLY_ACTIVE_DATABASES` respecté. Les collections `Database` (GLPI) et `databases` (Mercator) ne sont chargées que si au moins une Appliance a une base liée. `databases` ne faisant pas partie de la synchronisation complète par défaut, lancer `php application glpi:sync --type=databases --type=appliance_links` pour que les bases existent dans Mercator avant d'être liées.
 
 **Prérequis** :
 - `GLPI_APPLIANCE_MERCATOR_ENDPOINT=applications` — en mode `activities` (défaut), `appliance_links` n'a rien à lier et journalise un simple warning, sans erreur.
 - `appliances` et `applications` doivent avoir été synchronisés au préalable (catalogue applicatif issu des Appliances).
+- `databases` doit avoir été synchronisé au préalable pour les liens application ↔ database ; sinon les `Database` liées sont simplement ignorées (log debug).
 - `logical_servers` doit avoir été synchronisé au préalable : seuls les `Computer` déjà présents comme serveur logique Mercator (routés via `GLPI_COMPUTER_TYPES_LOGICAL_SERVERS`) sont liés. Un `Computer` lié à l'Appliance mais non retenu par ce filtre (ex. simple poste de travail) est ignoré silencieusement (log debug), sans compter comme erreur.
 
-**Remplacement, pas fusion** : le tableau `logical_servers` envoyé à chaque exécution **remplace** la liste des serveurs logiques liés à l'application (comportement standard des champs de relation Mercator, identique à `activities`/`applications` sur `links`/`activity_links`) — un `Computer` retiré de l'Appliance côté GLPI est délié à la synchronisation suivante.
+**Remplacement, pas fusion** : les tableaux `logical_servers` et `databases` envoyés à chaque exécution **remplacent** la liste des serveurs logiques / bases liés à l'application. Chacun n'est envoyé que s'il contient au moins un lien résolu : une relation sans aucun élément résolu côté GLPI est laissée intacte dans Mercator. Comportement standard des champs de relation Mercator, identique à `activities`/`applications` sur `links`/`activity_links` : un `Computer` ou une `Database` retiré de l'Appliance côté GLPI est délié à la synchronisation suivante, tant qu'il reste au moins un autre élément du même type.
 
 #### Liens database ↔ serveur logique (`database_links`)
 
@@ -1179,12 +1182,13 @@ grep "\[activity_links\]" storage/logs/laravel.log
 
 > Si vous confirmez qu'un lien existe bien côté GLPI (Appliance → onglet "Éléments liés") mais que le log affiche quand même `Appliance sans logiciels liés`/`Appliance sans Computer lié`, vérifiez la version du connecteur : les versions antérieures au correctif `with_items` (cf. note « Historique » plus haut) ne détectaient jamais aucun lien, silencieusement. Mettez à jour vers la dernière version.
 
-#### Aucun lien application↔serveur logique créé (`appliance_links`)
+#### Aucun lien application↔serveur logique / database créé (`appliance_links`)
 
 Prérequis :
 1. `GLPI_APPLIANCE_MERCATOR_ENDPOINT=applications` — en mode `activities` (défaut), `appliance_links` ne fait rien (warning journalisé, ce n'est pas une erreur)
 2. Les syncs `appliances`, `applications` et `logical_servers` doivent avoir été exécutées avant `appliance_links`
 3. Les `Computer` doivent être **directement rattachés aux Appliances** dans GLPI (onglet "Éléments liés" → Ordinateur) et routés vers `logical-servers` via `GLPI_COMPUTER_TYPES_LOGICAL_SERVERS`
+4. Pour les liens application ↔ database : les `Database` (et non leur `DatabaseInstance`) doivent être rattachées aux Appliances, et `--type=databases` exécuté avant `appliance_links`
 
 ```bash
 LOG_LEVEL=debug php application glpi:sync --type=appliance_links
