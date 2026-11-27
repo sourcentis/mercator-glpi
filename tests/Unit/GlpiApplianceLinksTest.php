@@ -16,9 +16,20 @@ use Mockery\MockInterface;
 // 'name' n'étant utilisé que pour simuler la réponse du getItem('Computer', id) de
 // repli (déclenché seulement si le matching par ext_refs échoue).
 
-function applianceLinksGlpiMock(array $appliances): MockInterface
+function applianceLinksGlpiMock(array $appliances, ?array $glpiDatabases = null): MockInterface
 {
     $mock = Mockery::mock(GlpiClientInterface::class);
+
+    // Collection Database GLPI : chargée paresseusement, seulement si une Appliance
+    // porte un pivot itemtype=Database (null = ne doit jamais être demandée).
+    if ($glpiDatabases === null) {
+        $mock->shouldNotReceive('getItems')->with('Database', Mockery::any());
+    } else {
+        $mock->shouldReceive('getItems')
+            ->with('Database', Mockery::type('array'))
+            ->once()
+            ->andReturn($glpiDatabases);
+    }
 
     $mock->shouldReceive('getItems')
         ->with('Appliance', Mockery::type('array'))
@@ -34,6 +45,14 @@ function applianceLinksGlpiMock(array $appliances): MockInterface
                 'appliances_id' => $appliance['id'],
                 'items_id' => $computer['items_id'] ?? null,
                 'itemtype' => 'Computer',
+            ];
+        }
+        foreach ($appliance['databases'] ?? [] as $i => $databaseId) {
+            $pivotRows[] = [
+                'id' => ($appliance['id'] * 1000) + 500 + $i,
+                'appliances_id' => $appliance['id'],
+                'items_id' => $databaseId,
+                'itemtype' => 'Database',
             ];
         }
 
@@ -54,11 +73,17 @@ function applianceLinksGlpiMock(array $appliances): MockInterface
     return $mock;
 }
 
-function applianceLinksMercatorMock(array $applications, array $logicalServers): MockInterface
+function applianceLinksMercatorMock(array $applications, array $logicalServers, ?array $databases = null): MockInterface
 {
     $mock = Mockery::mock(MercatorClientInterface::class);
     $mock->shouldReceive('getAll')->with('applications')->andReturn($applications);
     $mock->shouldReceive('getAll')->with('logical-servers')->andReturn($logicalServers);
+
+    if ($databases === null) {
+        $mock->shouldNotReceive('getAll')->with('databases');
+    } else {
+        $mock->shouldReceive('getAll')->with('databases')->once()->andReturn($databases);
+    }
 
     return $mock;
 }
@@ -354,5 +379,159 @@ it('ignore une ligne pivot Computer sans items_id numérique, sans planter', fun
         $mercator,
     );
 
+    expect($stats['errors'])->toBe(0);
+});
+
+// ── Liens application ↔ database (Appliance_Item itemtype=Database, issue #17) ──
+
+function testApplianceWithDatabases(array $computerItems, array $databaseIds, int $id = 42, string $name = 'ERP'): array
+{
+    return testAppliance($computerItems, $id, $name) + ['databases' => $databaseIds];
+}
+
+function captureApplianceUpdates(MockInterface $mercator, array &$updated): void
+{
+    $mercator->shouldReceive('update')
+        ->andReturnUsing(function (string $ep, int $id, array $payload) use (&$updated) {
+            $updated[$id] = $payload;
+
+            return [];
+        });
+}
+
+it('lie une application aux databases rattachées à l\'appliance, dans le même PUT que les serveurs logiques', function () {
+    config(['glpi.appliance_mercator_endpoint' => 'applications']);
+
+    $updated = [];
+    $mercator = applianceLinksMercatorMock(testApplianceApplications(), testApplianceLogicalServers(), [
+        ['id' => 500, 'name' => 'erp_prod', 'ext_refs' => '{GLPI}7'],
+        ['id' => 501, 'name' => 'erp_audit', 'ext_refs' => '{GLPI}8'],
+    ]);
+    captureApplianceUpdates($mercator, $updated);
+
+    $glpi = applianceLinksGlpiMock(
+        [testApplianceWithDatabases([['items_id' => 10, 'name' => null]], [7, 8])],
+        [['id' => 7, 'name' => 'erp_prod'], ['id' => 8, 'name' => 'erp_audit']],
+    );
+
+    $stats = (new GlpiSyncService)->syncApplianceLinks($glpi, $mercator);
+
+    expect($updated[200]['logical_servers'])->toBe([300]);
+    expect($updated[200]['databases'])->toBe([500, 501]);
+    expect($stats['updated'])->toBe(1);
+});
+
+it('lie les databases d\'une appliance sans Computer, sans envoyer logical_servers', function () {
+    config(['glpi.appliance_mercator_endpoint' => 'applications']);
+
+    $updated = [];
+    $mercator = applianceLinksMercatorMock(testApplianceApplications(), testApplianceLogicalServers(), [
+        ['id' => 500, 'name' => 'erp_prod', 'ext_refs' => '{GLPI}7'],
+    ]);
+    captureApplianceUpdates($mercator, $updated);
+
+    $glpi = applianceLinksGlpiMock(
+        [testApplianceWithDatabases([], [7])],
+        [['id' => 7, 'name' => 'erp_prod']],
+    );
+
+    (new GlpiSyncService)->syncApplianceLinks($glpi, $mercator);
+
+    expect(array_keys($updated[200]))->toEqualCanonicalizing(['name', 'databases']);
+    expect($updated[200]['databases'])->toBe([500]);
+});
+
+it('lie chaque base homonyme à sa propre appliance via ext_refs (noms suffixés côté Mercator)', function () {
+    config(['glpi.appliance_mercator_endpoint' => 'applications']);
+
+    $applications = [
+        ['id' => 200, 'name' => 'ERP', 'ext_refs' => '{GLPI-Appliance}42'],
+        ['id' => 201, 'name' => 'CRM', 'ext_refs' => '{GLPI-Appliance}43'],
+    ];
+
+    $updated = [];
+    $mercator = applianceLinksMercatorMock($applications, testApplianceLogicalServers(), [
+        ['id' => 500, 'name' => 'glpi (srv-db01)', 'ext_refs' => '{GLPI}4'],
+        ['id' => 501, 'name' => 'glpi (srv-db02)', 'ext_refs' => '{GLPI}80'],
+    ]);
+    captureApplianceUpdates($mercator, $updated);
+
+    $glpi = applianceLinksGlpiMock(
+        [
+            testApplianceWithDatabases([], [4], id: 42, name: 'ERP'),
+            testApplianceWithDatabases([], [80], id: 43, name: 'CRM'),
+        ],
+        [['id' => 4, 'name' => 'glpi'], ['id' => 80, 'name' => 'glpi']],
+    );
+
+    (new GlpiSyncService)->syncApplianceLinks($glpi, $mercator);
+
+    expect($updated[200]['databases'])->toBe([500]);
+    expect($updated[201]['databases'])->toBe([501]);
+});
+
+it('ne résout pas par nom une base homonyme ni vers un enregistrement tagué par une autre base', function () {
+    config(['glpi.appliance_mercator_endpoint' => 'applications']);
+
+    $updated = [];
+    $mercator = applianceLinksMercatorMock(testApplianceApplications(), testApplianceLogicalServers(), [
+        ['id' => 500, 'name' => 'glpi', 'ext_refs' => null],        // non tagué, mais nom homonyme côté GLPI
+        ['id' => 501, 'name' => 'crm', 'ext_refs' => '{GLPI}99'],   // tagué par une autre base
+        ['id' => 502, 'name' => 'Legacy', 'ext_refs' => null],      // non tagué, nom unique → repli OK
+    ]);
+    captureApplianceUpdates($mercator, $updated);
+
+    $glpi = applianceLinksGlpiMock(
+        [testApplianceWithDatabases([], [4, 5, 6])],
+        [
+            ['id' => 4, 'name' => 'glpi'],
+            ['id' => 80, 'name' => 'glpi'],
+            ['id' => 5, 'name' => 'crm'],
+            ['id' => 6, 'name' => 'legacy'],
+        ],
+    );
+
+    (new GlpiSyncService)->syncApplianceLinks($glpi, $mercator);
+
+    expect($updated[200]['databases'])->toBe([502]);
+});
+
+it('ignore les databases exclues par GLPI_SYNC_ONLY_ACTIVE_DATABASES', function () {
+    config([
+        'glpi.appliance_mercator_endpoint' => 'applications',
+        'glpi.sync.only_active_databases' => true,
+    ]);
+
+    $updated = [];
+    $mercator = applianceLinksMercatorMock(testApplianceApplications(), testApplianceLogicalServers(), [
+        ['id' => 500, 'name' => 'erp_prod', 'ext_refs' => '{GLPI}7'],
+        ['id' => 501, 'name' => 'erp_old', 'ext_refs' => '{GLPI}8'],
+    ]);
+    captureApplianceUpdates($mercator, $updated);
+
+    $glpi = applianceLinksGlpiMock(
+        [testApplianceWithDatabases([], [7, 8])],
+        [['id' => 7, 'name' => 'erp_prod', 'is_active' => 1], ['id' => 8, 'name' => 'erp_old', 'is_active' => 0]],
+    );
+
+    (new GlpiSyncService)->syncApplianceLinks($glpi, $mercator);
+
+    expect($updated[200]['databases'])->toBe([500]);
+});
+
+it('ne met pas à jour l\'application quand aucune database liée ne se résout', function () {
+    config(['glpi.appliance_mercator_endpoint' => 'applications']);
+
+    $mercator = applianceLinksMercatorMock(testApplianceApplications(), testApplianceLogicalServers(), []);
+    $mercator->shouldNotReceive('update');
+
+    $glpi = applianceLinksGlpiMock(
+        [testApplianceWithDatabases([], [7])],
+        [['id' => 7, 'name' => 'erp_prod']],
+    );
+
+    $stats = (new GlpiSyncService)->syncApplianceLinks($glpi, $mercator);
+
+    expect($stats['updated'])->toBe(0);
     expect($stats['errors'])->toBe(0);
 });
